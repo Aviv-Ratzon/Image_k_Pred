@@ -143,12 +143,80 @@ class Discriminator(nn.Module):
 
 
 
+class ConditionalVAE(nn.Module):
+    """
+    Conditional VAE for predicting a target image x_next given a condition c.
+
+    We use:
+      - x = target image (flattened MNIST, normalized to [-1, 1])
+      - c = concat(source_image, action)
+
+    Encoder approximates q(z | x, c); decoder models p(x | z, c).
+    """
+
+    def __init__(self, image_dim: int, latent_dim: int = 32, hidden_dim: int = 1024):
+        super().__init__()
+        self.image_dim = image_dim
+        self.latent_dim = latent_dim
+
+        # Condition is (source_image + action)
+        self.cond_dim = image_dim + 1
+
+        enc_in = image_dim + self.cond_dim
+        self.encoder = nn.Sequential(
+            nn.Linear(enc_in, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),
+        )
+        self.fc_mu = nn.Linear(512, latent_dim)
+        self.fc_logvar = nn.Linear(512, latent_dim)
+
+        dec_in = latent_dim
+        self.decoder = nn.Sequential(
+            nn.Linear(dec_in, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),
+            nn.Linear(512, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, image_dim),
+            nn.Tanh(),
+        )
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def encode(self, x: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.encoder(torch.cat([x, cond], dim=1))
+        return self.fc_mu(h), self.fc_logvar(h), h
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+
+    def forward(
+        self, x: torch.Tensor, cond: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar, h = self.encode(x, cond)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        return recon, mu, logvar, z, h
+
+
 if __name__ == "__main__":
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
     ])
-    dataset = MNISTActionDataset(A=0, transform=transform)
+    # Increase A for more interesting "action -> target digit" transitions.
+    # Set A=0 to make target always match the source digit.
+    A = 2
+    dataset = MNISTActionDataset(A=A, transform=transform)
     image, label, target_image, target_label, action = dataset[0]
 
     fig, axs = plt.subplots(1, 2, figsize=(7, 3))
@@ -158,8 +226,7 @@ if __name__ == "__main__":
     fig.colorbar(im, ax=axs[1])
     plt.show()
 
-    G = Generator(out_dim=image.shape[0]).to(device)
-    D = Discriminator(in_dim=image.shape[0]).to(device)
+    model = ConditionalVAE(image_dim=image.shape[0], latent_dim=32, hidden_dim=1024).to(device)
 
     # ----------------------------
     # Loss + Optimizers
@@ -167,91 +234,88 @@ if __name__ == "__main__":
     lr = 0.0002
     epochs = 20
     batch_size = 128
-    lambda_pixel = 0.1 # Hyperparameter to balance GAN vs Reconstruction
+    beta_kl = 0.05  # KL weight (beta-VAE); tune up/down to trade off sharpness vs structure
 
-    criterion = nn.CrossEntropyLoss()
-    L1_criterion = nn.L1Loss()
-    
-    opt_G = optim.Adam(G.parameters(), lr=lr)
-    opt_D = optim.Adam(D.parameters(), lr=lr/2)
+    recon_criterion = nn.L1Loss()
+
+    opt = optim.Adam(model.parameters(), lr=lr)
 
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    loss_D_l = []
-    loss_G_l = []
+    loss_total_l = []
+    loss_recon_l = []
+    loss_kl_l = []
     hidden_l = []
     target_label_l = []
     for epoch in range(1, epochs + 1):
-        loss_D_epoch = 0
-        loss_G_epoch = 0
+        loss_total_epoch = 0
+        loss_recon_epoch = 0
+        loss_kl_epoch = 0
         for real_imgs, labels, target_imgs, target_labels, actions in train_loader:
             real_imgs = real_imgs.to(device)
             labels = labels.to(device)
             target_imgs = target_imgs.to(device)
             target_labels = target_labels.to(device)
-            actions = actions.to(device)
+            actions = actions.to(device).float()
+
+            # Condition: (source image, action)
+            cond = torch.cat([real_imgs, actions.unsqueeze(1)], dim=1)
 
             # ------------------------
-            # Train Discriminator
+            # Train cVAE
             # ------------------------
-            fake_imgs, _ = G(real_imgs, actions.unsqueeze(1))  # detach so G isn't updated here
+            recon, mu, logvar, z, h = model(target_imgs, cond)
 
-            real_labels = target_labels
-            fake_labels = torch.zeros(len(real_labels), device=device).long() + 10
+            recon_loss = recon_criterion(recon, target_imgs)
+            # KL(q(z|x,c) || N(0,1)) averaged over batch
+            kl_loss = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)).mean()
 
-            D_real_logits = D(target_imgs)
-            D_fake_logits = D(fake_imgs.detach())
+            total_loss = recon_loss + beta_kl * kl_loss
 
-            loss_D_real = criterion(D_real_logits, target_labels)
-            loss_D_fake = criterion(D_fake_logits, fake_labels)
-            loss_D = (loss_D_real + loss_D_fake) / 2
+            opt.zero_grad()
+            total_loss.backward()
+            opt.step()
 
-            opt_D.zero_grad()
-            loss_D.backward()
-            opt_D.step()
+            loss_total_epoch += total_loss.item()
+            loss_recon_epoch += recon_loss.item()
+            loss_kl_epoch += kl_loss.item()
 
-            # ------------------------
-            # Train Generator
-            # ------------------------
-            gen_imgs, hidden = G(real_imgs, actions.unsqueeze(1))
-            # Want D(gen_imgs) -> "real" (1)
-            D_gen_logits = D(gen_imgs)
-            loss_G = criterion(D_gen_logits, real_labels)
-
-            # Inside the Generator training block
-            loss_pixel = L1_criterion(gen_imgs, target_imgs) # Force it to match the ground truth target
-
-            # Combine losses
-            total_loss_G = loss_G + (lambda_pixel * loss_pixel)
-
-            opt_G.zero_grad()
-            loss_G.backward()
-            opt_G.step()
-
-            loss_D_epoch += loss_D.item()
-            loss_G_epoch += loss_G.item()
-            hidden_l.append(hidden.detach().cpu().numpy())
+            # Use mu as a stable "hidden state" for PCA visualization
+            hidden_l.append(h.detach().cpu().numpy())
             target_label_l.append(target_labels.detach().cpu().numpy())
 
-        loss_D_l.append(loss_D_epoch / len(train_loader))
-        loss_G_l.append(loss_G_epoch / len(train_loader))
+        loss_total_l.append(loss_total_epoch / len(train_loader))
+        loss_recon_l.append(loss_recon_epoch / len(train_loader))
+        loss_kl_l.append(loss_kl_epoch / len(train_loader))
 
         # Save sample grid each epoch
         with torch.no_grad():
-            samples = G(real_imgs, actions.unsqueeze(1))[0].view(-1, 1, 28, 28)
-            # grid = make_grid(samples, nrow=8, normalize=True, value_range=(-1, 1))
-            # save_image(grid, f"figures/samples/mnist_gan_epoch_{epoch:03d}.png")
+            # Prior samples for conditional generation (not just reconstruction)
+            z_prior = torch.randn(real_imgs.shape[0], model.latent_dim, device=device)
+            gen = model.decode(z_prior)
+
+            # Reconstructions (posterior) for reference
+            recon_vis, _, _, _, _ = model(target_imgs, cond)
+
+            samples = gen.view(-1, 1, 28, 28)
+            recons = recon_vis.view(-1, 1, 28, 28)
 
         n = 5
-        fig, axs_all = plt.subplots(n, 2, figsize=(7, 3*n))
+        fig, axs_all = plt.subplots(n, 3, figsize=(10, 3*n))
         for i in range(n):
             axs = axs_all[i]
             axs[0].imshow(real_imgs[i].reshape(28, 28).cpu().numpy(), cmap='gray')
             axs[0].set_ylabel(f's: {labels[i].item()}, s_next: {target_labels[i].item()}, a: {actions[i].item()}')
-            im = axs[1].imshow(samples[i].reshape(28, 28).cpu().numpy(), cmap='gray')
-            axs[1].set_title(f'a: {actions[i].item()}, s: {target_labels[i].item()}')
+            axs[0].set_title("source")
+
+            axs[1].imshow(target_imgs[i].reshape(28, 28).cpu().numpy(), cmap='gray')
+            axs[1].set_title("target")
+
+            axs[2].imshow(samples[i].reshape(28, 28).cpu().numpy(), cmap='gray')
+            axs[2].set_title("generated (prior)")
             axs[0].axis('off')
             axs[1].axis('off')
+            axs[2].axis('off')
         fig.tight_layout()
         plt.savefig(f"figures/samples/samples_epoch_{epoch:03d}.png")
         plt.close()
@@ -283,28 +347,37 @@ if __name__ == "__main__":
         plt.close()
 
 
-        print(f"Epoch {epoch:03d} | loss_D: {loss_D.item():.4f} | loss_G: {loss_G.item():.4f}")
+        print(
+            f"Epoch {epoch:03d} | loss_total: {loss_total_l[-1]:.4f} | "
+            f"recon: {loss_recon_l[-1]:.4f} | kl: {loss_kl_l[-1]:.4f}"
+        )
 
 
     fig, ax = plt.subplots(figsize=(7, 3))
-    ax.plot(loss_D_l, label='loss_D')
-    ax.plot(loss_G_l, label='loss_G')
+    ax.plot(loss_total_l, label='loss_total')
+    ax.plot(loss_recon_l, label='loss_recon')
+    ax.plot(loss_kl_l, label='loss_kl')
     plt.yscale('log')
     ax.legend()
     plt.savefig(f"figures/loss.png")
     plt.show()
 
     n = 5
-    fig, axs_all = plt.subplots(n, 2, figsize=(7, 3*n))
+    fig, axs_all = plt.subplots(n, 3, figsize=(10, 3*n))
     for i in range(n):
         axs = axs_all[i]
         axs[0].imshow(real_imgs[i].reshape(28, 28).cpu().numpy(), cmap='gray')
         axs[0].set_ylabel(f's: {labels[i].item()}, s_next: {target_labels[i].item()}, a: {actions[i].item()}')
-        im = axs[1].imshow(samples[i].reshape(28, 28).cpu().numpy(), cmap='gray')
-        axs[1].set_title(f'a: {actions[i].item()}, s: {target_labels[i].item()}')
-        
+
+        axs[1].imshow(target_imgs[i].reshape(28, 28).cpu().numpy(), cmap='gray')
+        axs[1].set_title("target")
+
+        axs[2].imshow(samples[i].reshape(28, 28).cpu().numpy(), cmap='gray')
+        axs[2].set_title("generated (prior)")
+
         axs[0].axis('off')
         axs[1].axis('off')
+        axs[2].axis('off')
     fig.tight_layout()
     plt.savefig(f"figures/samples.png")
     plt.show()
