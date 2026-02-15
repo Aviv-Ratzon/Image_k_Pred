@@ -212,13 +212,10 @@ class Decoder(nn.Module):
 
 class ConditionalVAE(nn.Module):
     """
-    Conditional VAE for predicting a target image x_next given a condition c.
+    Conditional VAE for predicting a target image x_target given condition c = [source_image, action_onehot].
 
-    We use:
-      - x = target image (flattened MNIST, normalized to [-1, 1])
-      - c = concat(source_image, action)
-
-    Encoder approximates q(z | x, c); decoder models p(x | z, c).
+    Encoder: q(z | x_target, cond)
+    Decoder: p(x_target | z, cond)
     """
 
     def __init__(self, image_dim: int, latent_dim: int = 32, hidden_dim: int = 1024, action_dim: int = 1, image_actions=False):
@@ -226,11 +223,12 @@ class ConditionalVAE(nn.Module):
         self.image_dim = image_dim
         self.latent_dim = latent_dim
         self.action_dim = action_dim
+        self.cond_dim = image_dim + action_dim  # cond = [source_image, action_onehot]
 
-        enc_in = image_dim + action_dim
-        # Encoder: 3 conv layers (with ReLU), then flatten, then fully connected
+        # Encoder input: concat(x_target, cond) -> image_dim + cond_dim
+        enc_in = image_dim + self.cond_dim
         self.encoder = nn.Sequential(
-            nn.Linear(image_dim + self.action_dim, hidden_dim),
+            nn.Linear(enc_in, hidden_dim),
             nn.ReLU(True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(True),
@@ -239,27 +237,21 @@ class ConditionalVAE(nn.Module):
             nn.Linear(hidden_dim, hidden_dim//2),
             nn.ReLU(True),
         )
-        # self.fc_enc = nn.Sequential(
-        #     nn.Linear(hidden_dim + self.action_dim, hidden_dim//2),
-        #     nn.ReLU(True),
-        # )
-        # self.encoder = Encoder(input_channels=1, action_dim=action_dim, latent_dim=hidden_dim//2, n_layers=4, hidden_dim=hidden_dim//2, image_actions=image_actions)
         self.fc_mu = nn.Linear(hidden_dim//2, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim//2, latent_dim)
 
-        dec_in = latent_dim
+        # Decoder input: concat(z, cond) -> latent_dim + cond_dim
+        dec_in = latent_dim + self.cond_dim
         self.decoder = nn.Sequential(
             nn.Linear(dec_in, hidden_dim),
             nn.ReLU(True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(True),
         )
-
-        self.fc_out =  nn.Sequential(
+        self.fc_out = nn.Sequential(
             nn.Linear(hidden_dim, image_dim),
             nn.Tanh(),
         )
-        # self.decoder = Decoder(latent_dim=latent_dim, output_channels=1)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -267,24 +259,88 @@ class ConditionalVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def encode(self, x: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.encoder(torch.cat([x, cond], dim=1))
-        # h = self.fc_enc(h)
+    def encode(self, x_target: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q(z | x_target, cond)"""
+        h = self.encoder(torch.cat([x_target, cond], dim=1))
         return self.fc_mu(h), self.fc_logvar(h), h
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        h = self.decoder(z)
+    def decode(self, z: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """p(x_target | z, cond)"""
+        h = self.decoder(torch.cat([z, cond], dim=1))
         return self.fc_out(h), h
-        # out, h = self.decoder(z)
-        # return out, h
 
     def forward(
-        self, x: torch.Tensor, cond: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, logvar, h_encoder = self.encode(x, cond)
+        self, x_target: torch.Tensor, cond: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar, h_encoder = self.encode(x_target, cond)
         z = self.reparameterize(mu, logvar)
-        recon, h_decoder = self.decode(z)
+        recon, h_decoder = self.decode(z, cond)
         return recon, mu, logvar, z, h_encoder, h_decoder
+
+    def generate(
+        self, source_imgs: torch.Tensor, action_obs: torch.Tensor, n_samples: int = 1
+    ) -> torch.Tensor:
+        """Inference: z ~ N(0,I), x_hat = decode(z, cond). Returns [B, 784] or [n_samples, B, 784]."""
+        cond = torch.cat([source_imgs, action_obs], dim=1)
+        B = source_imgs.size(0)
+        samples = []
+        for _ in range(n_samples):
+            z = torch.randn(B, self.latent_dim, device=source_imgs.device, dtype=source_imgs.dtype)
+            x_hat, _ = self.decode(z, cond)
+            samples.append(x_hat)
+        if n_samples == 1:
+            return samples[0]
+        return torch.stack(samples, dim=0)  # [n_samples, B, 784]
+
+
+class MNISTClassifier(nn.Module):
+    """Minimal CNN classifier for MNIST. Conv(1→32)+ReLU+MaxPool, Conv(32→64)+ReLU+MaxPool, FC→128+ReLU, FC→10."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 28->14
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),  # 14->7
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, 1, 28, 28], returns logits [B, 10]"""
+        h = self.conv(x)
+        return self.fc(h)
+
+
+def pretrain_classifier(clf: nn.Module, train_loader: DataLoader, epochs: int = 5, device=None):
+    """Pretrain classifier on (image, label) from MNIST. Uses target_imgs/target_labels as proxy for digit."""
+    if device is None:
+        device = next(clf.parameters()).device
+    clf.train()
+    opt = optim.Adam(clf.parameters(), lr=0.001)
+    for epoch in range(epochs):
+        correct, total = 0, 0
+        for _, _, target_imgs, target_labels, _, _ in train_loader:
+            target_imgs = target_imgs.to(device)
+            target_labels = target_labels.to(device)
+            # Reshape to [B, 1, 28, 28]
+            x = target_imgs.view(-1, 1, 28, 28)
+            logits = clf(x)
+            loss = nn.CrossEntropyLoss()(logits, target_labels)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            pred = logits.argmax(dim=1)
+            correct += (pred == target_labels).sum().item()
+            total += target_labels.size(0)
+        print(f"  Classifier pretrain epoch {epoch+1}/{epochs} acc: {100*correct/total:.2f}%")
 
 
 if __name__ == "__main__":
@@ -319,46 +375,66 @@ if __name__ == "__main__":
 
         model = ConditionalVAE(image_dim=image.shape[0], latent_dim=32, hidden_dim=1024, action_dim=one_hot_action.shape[0], image_actions=image_actions).to(device)
 
-        # ----------------------------jan
-        # Loss + Optimizers 
+        # ----------------------------
+        # Hyperparameters
         # ----------------------------
         lr = 0.0002
-        epochs = 10
+        epochs = 50
         batch_size = 64
-        beta_kl = 0.025 # KL weight (beta-VAE); tune up/down to trade off sharpness vs structure
+
+        # MNIST classifier (pretrained, frozen)
+        clf = MNISTClassifier().to(device)
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        print("Pretraining classifier...")
+        pretrain_classifier(clf, train_loader, epochs=5, device=device)
+        for p in clf.parameters():
+            p.requires_grad = False
+
+        # Loss weights
+        beta_kl_target = 0.025  # target KL weight; use annealing
+        lambda_cls = 1.0
+        kl_anneal_epochs = 20  # ramp beta_kl from 0 to target over first N epochs
 
         recon_criterion = nn.L1Loss()
+        cls_criterion = nn.CrossEntropyLoss()
 
         opt = optim.AdamW(model.parameters(), lr=lr)
-
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         loss_total_l = []
         loss_recon_l = []
         loss_kl_l = []
+        loss_cls_l = []
         for epoch in range(1, epochs + 1):
+            # KL annealing: ramp from 0 to beta_kl_target over first kl_anneal_epochs
+            if epoch <= kl_anneal_epochs:
+                beta_kl = beta_kl_target * (epoch / kl_anneal_epochs)
+            else:
+                beta_kl = beta_kl_target
+
             loss_total_epoch = 0
             loss_recon_epoch = 0
             loss_kl_epoch = 0
+            loss_cls_epoch = 0
             for real_imgs, labels, target_imgs, target_labels, actions, action_obs in train_loader:
                 real_imgs = real_imgs.to(device)
                 labels = labels.to(device)
                 target_imgs = target_imgs.to(device)
                 target_labels = target_labels.to(device)
                 actions = actions.to(device).float()
-                action_obs = action_obs.to(device)
-                # Condition: (source image, action)
+                action_obs = action_obs.to(device)  # [B, 2A+1]
 
-                # ------------------------
-                # Train cVAE
-                # ------------------------
-                recon, mu, logvar, z, h_encoder, h_decoder = model(real_imgs, action_obs)
+                cond = torch.cat([real_imgs, action_obs], dim=1)  # [B, 784 + 2A+1]
+                recon, mu, logvar, z, h_encoder, h_decoder = model(target_imgs, cond)
 
                 recon_loss = recon_criterion(recon, target_imgs)
-                # KL(q(z|x,c) || N(0,1)) averaged over batch
                 kl_loss = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)).mean()
 
-                total_loss = recon_loss + beta_kl * kl_loss
+                # Auxiliary classifier loss on generated/reconstructed images
+                recon_img = recon.view(-1, 1, 28, 28)
+                logits = clf(recon_img)
+                cls_loss = cls_criterion(logits, target_labels)
+
+                total_loss = recon_loss + beta_kl * kl_loss + lambda_cls * cls_loss
 
                 opt.zero_grad()
                 total_loss.backward()
@@ -367,50 +443,47 @@ if __name__ == "__main__":
                 loss_total_epoch += total_loss.item()
                 loss_recon_epoch += recon_loss.item()
                 loss_kl_epoch += kl_loss.item()
+                loss_cls_epoch += cls_loss.item()
+
             loss_total_l.append(loss_total_epoch / len(train_loader))
             loss_recon_l.append(loss_recon_epoch / len(train_loader))
             loss_kl_l.append(loss_kl_epoch / len(train_loader))
+            loss_cls_l.append(loss_cls_epoch / len(train_loader))
 
-            # Save sample grid each epoch
-            with torch.no_grad():
-                
-                hidden_encoder_l = []
-                hidden_decoder_l = []
-                z_l = []
-                mu_l = []
-                target_label_l = []
-                action_l = []
-                for real_imgs, labels, target_imgs, target_labels, actions, action_obs in train_loader:
-                    real_imgs = real_imgs.to(device)
-                    labels = labels.to(device)
-                    target_imgs = target_imgs.to(device)
-                    target_labels = target_labels.to(device)
-                    actions = actions.to(device).float()
-                    action_obs = action_obs.to(device)
-                    # Condition: (source image, action)
-
-                    # ------------------------
-                    # Train cVAE
-                    # ------------------------
-                    recon, mu, logvar, z, h_encoder, h_decoder = model(real_imgs, action_obs)
-
-                    # Use mu as a stable "hidden state" for PCA visualization
-                    hidden_encoder_l.append(h_encoder.detach().cpu().numpy())
-                    hidden_decoder_l.append(h_decoder.detach().cpu().numpy())
-                    z_l.append(z.detach().cpu().numpy())
-                    mu_l.append(mu.detach().cpu().numpy())
-                    target_label_l.append(target_labels.detach().cpu().numpy())
-                    action_l.append(actions.detach().cpu().numpy())
-
-
-                # Reconstructions (posterior) for reference
-                recon_vis, _, _, _, _, _ = model(real_imgs, action_obs)
-
-                recons = recon_vis.view(-1, 28, 28)
             print(
                 f"Epoch {epoch:03d} | loss_total: {loss_total_l[-1]:.4f} | "
-                f"recon: {loss_recon_l[-1]:.4f} | kl: {loss_kl_l[-1]:.4f}"
+                f"recon: {loss_recon_l[-1]:.4f} | kl: {loss_kl_l[-1]:.4f} | cls: {loss_cls_l[-1]:.4f}"
             )
+
+        # Save sample grid each epoch
+        with torch.no_grad():
+            hidden_encoder_l = []
+            hidden_decoder_l = []
+            z_l = []
+            mu_l = []
+            target_label_l = []
+            action_l = []
+            for real_imgs, labels, target_imgs, target_labels, actions, action_obs in train_loader:
+                real_imgs = real_imgs.to(device)
+                labels = labels.to(device)
+                target_imgs = target_imgs.to(device)
+                target_labels = target_labels.to(device)
+                actions = actions.to(device).float()
+                action_obs = action_obs.to(device)
+                cond = torch.cat([real_imgs, action_obs], dim=1)
+                recon, mu, logvar, z, h_encoder, h_decoder = model(target_imgs, cond)
+
+                hidden_encoder_l.append(h_encoder.detach().cpu().numpy())
+                hidden_decoder_l.append(h_decoder.detach().cpu().numpy())
+                z_l.append(z.detach().cpu().numpy())
+                mu_l.append(mu.detach().cpu().numpy())
+                target_label_l.append(target_labels.detach().cpu().numpy())
+                action_l.append(actions.detach().cpu().numpy())
+
+            # Reconstructions (posterior) for reference
+            cond_vis = torch.cat([real_imgs, action_obs], dim=1)
+            recon_vis, _, _, _, _, _ = model(target_imgs, cond_vis)
+            recons = recon_vis.view(-1, 28, 28)
 
         print('Finished training, plotting loss, PCA and samples...')
 
@@ -418,17 +491,19 @@ if __name__ == "__main__":
         ax.plot(loss_total_l, label='loss_total')
         ax.plot(loss_recon_l, label='loss_recon')
         ax.plot(loss_kl_l, label='loss_kl')
+        ax.plot(loss_cls_l, label='loss_cls')
         plt.yscale('log')
         ax.legend()
         plt.savefig(f"{base_folder}/loss.png")
         plt.close()
 
+        # Posterior reconstructions (encode target, decode)
         n = 10
-        fig, axs_all = plt.subplots(n, 3*2+1, figsize=(2*(3*2+1), 2*n))
+        fig, axs_all = plt.subplots(n, 3*2+1, figsize=(2*7, 2*n))
         idx = 0
         for j in range(2):
             for i in range(n):
-                axs = axs_all[i, j*4:j*4+3]
+                axs = axs_all[i, j*3+j:j*3+3+j]
                 axs[0].imshow(real_imgs[idx].reshape(28, 28).cpu().numpy(), cmap='gray')
                 axs[0].set_ylabel(f's: {labels[idx].item()}, s_next: {target_labels[idx].item()}, a: {actions[idx].item()}')
 
@@ -444,6 +519,36 @@ if __name__ == "__main__":
                 idx += 1
         fig.tight_layout()
         plt.savefig(f"{base_folder}/samples.png")
+        plt.close()
+
+        # Prior samples from generate(): K samples per (source, action) - different z, same digit
+        K = 5
+        n_conds = 8
+        with torch.no_grad():
+            # Get a batch
+            batch = next(iter(train_loader))
+            real_imgs, labels, target_imgs, target_labels, actions, action_obs = [x.to(device) for x in batch]
+            real_imgs = real_imgs[:n_conds]
+            action_obs = action_obs[:n_conds]
+            labels = labels[:n_conds]
+            target_labels = target_labels[:n_conds]
+            actions = actions[:n_conds]
+            samples_prior = model.generate(real_imgs, action_obs, n_samples=K)  # [K, n_conds, 784]
+
+        fig, axs_all = plt.subplots(n_conds, 2 + K, figsize=(2*(2+K), 2*n_conds))
+        for i in range(n_conds):
+            axs_all[i, 0].imshow(real_imgs[i].reshape(28, 28).cpu().numpy(), cmap='gray')
+            axs_all[i, 0].set_ylabel(f's:{labels[i].item()} s_next:{target_labels[i].item()} a:{actions[i].item()}')
+            axs_all[i, 1].imshow(target_imgs[i].reshape(28, 28).cpu().numpy(), cmap='gray')
+            axs_all[i, 1].set_title("target")
+            for k in range(K):
+                axs_all[i, 2+k].imshow(samples_prior[k, i].cpu().numpy().reshape(28, 28), cmap='gray')
+                axs_all[i, 2+k].set_title(f"prior sample {k+1}")
+            for j in range(2 + K):
+                axs_all[i, j].axis('off')
+        fig.suptitle("Prior samples: z~N(0,I), decode(z, cond) - same (source,action), different handwriting")
+        fig.tight_layout()
+        plt.savefig(f"{base_folder}/samples_prior.png")
         plt.close()
     
 
