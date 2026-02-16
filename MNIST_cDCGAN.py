@@ -4,9 +4,8 @@ Conditioned on (source image, action) from MNISTActionDataset.
 Uses a ConditionEncoder (CNN + FCN) to encode the conditioning inputs.
 """
 
-import argparse
-import json
 import random
+from sklearn.decomposition import PCA
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +16,6 @@ from torchvision.utils import save_image, make_grid
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from sklearn.decomposition import PCA
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -131,29 +129,22 @@ class Generator(nn.Module):
         self.init_size = 7
         self.fc = nn.Linear(latent_dim + cond_dim, 256 * self.init_size ** 2)
 
-        self.conv_up = nn.Sequential(
+        self.conv_blocks = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 7 -> 14
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, 4, 2, 1),   # 14 -> 28
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-        )
-        self.conv_out = nn.Sequential(
             nn.Conv2d(64, 1, 3, 1, 1),
             nn.Tanh(),
         )
 
-    def forward(self, z, cond, return_hidden=False):
+    def forward(self, z, cond):
         x = torch.cat([z, cond], dim=1)
         x = self.fc(x)
         x = x.view(x.size(0), 256, self.init_size, self.init_size)
-        h_decoder = self.conv_up(x)  # [B, 64, 28, 28] - penultimate before output conv
-        x_fake = self.conv_out(h_decoder)
-        if return_hidden:
-            h_decoder_flat = h_decoder.view(h_decoder.size(0), -1)
-            return x_fake, h_decoder_flat
-        return x_fake
+        return self.conv_blocks(x)
 
 
 # ---------------------------------------------------------------------------
@@ -319,27 +310,28 @@ def plot_comparison(G, cond_encoder, train_loader, latent_dim, device, save_path
     """Plot source | target | generated with labels."""
     G.eval()
     cond_encoder.eval()
-    fig, axs = plt.subplots(n_rows, 3, figsize=(6, 2 * n_rows))
+    fig, axs = plt.subplots(n_rows, 7, figsize=(2*7, 2 * n_rows))
     with torch.no_grad():
         batch = next(iter(train_loader))
         (source_imgs, labels, target_imgs, target_labels, actions, action_obs) = [
             x.to(device) for x in batch
         ]
-        n = min(n_rows, source_imgs.size(0))
-        cond = cond_encoder(source_imgs[:n], action_obs[:n])
-        z = torch.randn(n, latent_dim, device=device)
+        n = min(n_rows, source_imgs.size(0)//2)
+        cond = cond_encoder(source_imgs, action_obs)
+        z = torch.randn(source_imgs.shape[0], latent_dim, device=device)
         fake_imgs = G(z, cond)
-
-        for i in range(n):
-            axs[i, 0].imshow(source_imgs[i, 0].cpu().numpy(), cmap="gray")
-            axs[i, 0].set_ylabel(f"s:{labels[i].item()}→{target_labels[i].item()} a:{actions[i].item()}")
-            axs[i, 0].axis("off")
-            axs[i, 1].imshow(target_imgs[i, 0].cpu().numpy(), cmap="gray")
-            axs[i, 1].set_title("Target")
-            axs[i, 1].axis("off")
-            axs[i, 2].imshow(fake_imgs[i, 0].cpu().numpy(), cmap="gray")
-            axs[i, 2].set_title("Generated")
-            axs[i, 2].axis("off")
+        for j in range(2):
+            for i in range(n):
+                ind = i + j*n
+                axs[i, j*4+0].imshow(source_imgs[ind, 0].cpu().numpy(), cmap="gray")
+                axs[i, j*4+0].set_ylabel(f"s:{labels[ind].item()}→{target_labels[ind].item()} a:{actions[ind].item()}")
+                axs[i, j*4+0].axis("off")
+                axs[i, j*4+1].imshow(target_imgs[ind, 0].cpu().numpy(), cmap="gray")
+                axs[i, j*4+1].set_title("Target")
+                axs[i, j*4+1].axis("off")
+                axs[i, j*4+2].imshow(fake_imgs[ind, 0].cpu().numpy(), cmap="gray")
+                axs[i, j*4+2].set_title("Generated")
+                axs[i, j*4+2].axis("off")
     axs[0, 0].set_title("Source")
     plt.suptitle("cDCGAN: source image + action → target")
     plt.tight_layout()
@@ -373,222 +365,48 @@ def plot_interpolation(G, cond_encoder, train_loader, latent_dim, device, save_p
     cond_encoder.train()
 
 
-def plot_pca_encoder_decoder(G, cond_encoder, train_loader, latent_dim, device, save_dir):
-    """
-    Plot PCA of ConditionEncoder output and Generator's decoder hidden states,
-    colored by target labels (and action), similar to main_GAN.py.
-    """
-    G.eval()
+def plot_cond_pca(cond_encoder, train_loader, device, save_path):
     cond_encoder.eval()
-    hidden_encoder_l = []
-    hidden_decoder_l = []
-    target_label_l = []
-    action_l = []
-
+    encoded_conds = []
+    labels_l = []
+    actions_l = []
     with torch.no_grad():
         for batch in train_loader:
-            (source_imgs, labels, target_imgs, target_labels, actions, action_obs) = [
-                x.to(device) for x in batch
-            ]
+            source_imgs = batch[0].to(device)
+            actions = batch[4].to(device)
+            action_obs = batch[5].to(device)
+            target_labels = batch[3].to(device)
             cond = cond_encoder(source_imgs, action_obs)
-            z = torch.randn(source_imgs.size(0), latent_dim, device=device)
-            _, h_decoder = G(z, cond, return_hidden=True)
-
-            hidden_encoder_l.append(cond.detach().cpu().numpy())
-            hidden_decoder_l.append(h_decoder.detach().cpu().numpy())
-            target_label_l.append(target_labels.detach().cpu().numpy())
-            action_l.append(actions.detach().cpu().numpy())
-
-    os.makedirs(f"{save_dir}/pca", exist_ok=True)
-    os.makedirs(f"{save_dir}/pca_centers", exist_ok=True)
-
-    for var_list, var_name in zip(
-        [hidden_encoder_l, hidden_decoder_l],
-        ["hidden_encoder", "hidden_decoder"],
-    ):
-        var_np = np.concatenate(var_list, axis=0)
-        label_np = np.concatenate(target_label_l, axis=0)
-        action_np = np.concatenate(action_l, axis=0)
-
-        pca = PCA(n_components=4)
-        var_pca = pca.fit_transform(var_np)
-        explained_variance_ratio = pca.explained_variance_ratio_
-
-        # Full PCA: colored by target label and action
-        fig, axs_all = plt.subplots(2, 2, figsize=(10, 10))
-        for pcs_i in range(2):
-            axs = axs_all[pcs_i]
-            for ax, color_var, color_label in zip(
-                axs, [label_np, action_np], ["target label", "action"]
-            ):
-                scatter = ax.scatter(
-                    var_pca[:, pcs_i * 2],
-                    var_pca[:, pcs_i * 2 + 1],
-                    c=color_var,
-                    cmap="coolwarm",
-                    alpha=0.7,
-                )
-                cbar = plt.colorbar(scatter, ax=ax)
-                cbar.set_label(color_label)
-                ax.set_xlabel(
-                    f"Component {2*pcs_i+1} ({100*explained_variance_ratio[2*pcs_i]:.2f}%)"
-                )
-                ax.set_ylabel(
-                    f"Component {2*pcs_i+2} ({100*explained_variance_ratio[2*pcs_i+1]:.2f}%)"
-                )
-                ax.set_title(f"PCA of {var_name} colored by {color_label}")
-        plt.tight_layout()
-        fig.savefig(f"{save_dir}/pca/pca_{var_name}.png")
-        plt.close()
-
-        # PCA centers (mean per target label, mean per action)
-        fig, axs_all = plt.subplots(2, 2, figsize=(10, 10))
-        for pcs_i in range(2):
-            axs = axs_all[pcs_i]
-            for ax, color_var, color_label in zip(
-                axs, [label_np, action_np], ["target label", "action"]
-            ):
-                var_pca_centers = np.array(
-                    [var_pca[color_var == i].mean(axis=0) for i in np.unique(color_var)]
-                )
-                scatter = ax.scatter(
-                    var_pca_centers[:, pcs_i * 2],
-                    var_pca_centers[:, pcs_i * 2 + 1],
-                    c=np.unique(color_var),
-                    cmap="coolwarm",
-                    alpha=0.7,
-                    s=100,
-                    edgecolors="black",
-                )
-                cbar = plt.colorbar(scatter, ax=ax)
-                cbar.set_label(color_label)
-                ax.set_xlabel(
-                    f"Component {2*pcs_i+1} ({100*explained_variance_ratio[2*pcs_i]:.2f}%)"
-                )
-                ax.set_ylabel(
-                    f"Component {2*pcs_i+2} ({100*explained_variance_ratio[2*pcs_i+1]:.2f}%)"
-                )
-                ax.set_title(f"PCA of {var_name} centers colored by {color_label}")
-                ax.axis("equal")
-        plt.tight_layout()
-        fig.savefig(f"{save_dir}/pca_centers/pca_{var_name}_centers.png")
-        plt.close()
-
-    G.train()
-    cond_encoder.train()
-
-
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-def get_config(
-    latent_dim=100,
-    batch_size=128,
-    epochs=30,
-    lr=2e-4,
-    A=5,
-    cond_dim=128,
-    cond_hidden=256,
-):
-    """Return config dict for reproducibility."""
-    return {
-        "latent_dim": latent_dim,
-        "batch_size": batch_size,
-        "epochs": epochs,
-        "lr": lr,
-        "A": A,
-        "cond_dim": cond_dim,
-        "cond_hidden": cond_hidden,
-        "action_dim": 2 * A + 1,
-    }
-
-
-def save_checkpoint(G, D, cond_encoder, config, loss_G_list, loss_D_list, save_path):
-    """Save model checkpoints and config to a file."""
-    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    torch.save(
-        {
-            "G_state_dict": G.state_dict(),
-            "D_state_dict": D.state_dict(),
-            "cond_encoder_state_dict": cond_encoder.state_dict(),
-            "config": config,
-            "loss_G": loss_G_list,
-            "loss_D": loss_D_list,
-        },
-        save_path,
-    )
-    config_path = save_path.replace(".pt", "_config.json")
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"Checkpoint saved to {save_path}")
-
-
-def load_checkpoint(checkpoint_path):
-    """Load checkpoint and return models, config, loss history."""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    config = ckpt["config"]
-    action_dim = config["action_dim"]
-    cond_dim = config["cond_dim"]
-    latent_dim = config["latent_dim"]
-    cond_hidden = config.get("cond_hidden", 256)
-
-    cond_encoder = ConditionEncoder(
-        action_dim=action_dim, cond_dim=cond_dim, hidden_dim=cond_hidden
-    ).to(device)
-    G = Generator(latent_dim=latent_dim, cond_dim=cond_dim).to(device)
-    D = Discriminator(cond_dim=cond_dim).to(device)
-
-    cond_encoder.load_state_dict(ckpt["cond_encoder_state_dict"])
-    G.load_state_dict(ckpt["G_state_dict"])
-    D.load_state_dict(ckpt["D_state_dict"])
-
-    loss_G_list = ckpt.get("loss_G", [])
-    loss_D_list = ckpt.get("loss_D", [])
-
-    return G, D, cond_encoder, config, loss_G_list, loss_D_list
-
-
-def visualize_only(checkpoint_path, out_dir=None):
-    """Load checkpoint and run all visualizations without training."""
-    print(f"Loading checkpoint from {checkpoint_path}")
-    G, D, cond_encoder, config, loss_G_list, loss_D_list = load_checkpoint(checkpoint_path)
-
-    latent_dim = config["latent_dim"]
-    batch_size = config["batch_size"]
-    A = config["A"]
-
-    if out_dir is None:
-        out_dir = "figures_cDCGAN"
-
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(f"{out_dir}/samples", exist_ok=True)
-
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ])
-    dataset = MNISTActionDataset(A=A, cyclic=False, transform=transform)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-
-    print("Saving visualizations...")
-    if loss_G_list and loss_D_list:
-        plot_loss(loss_G_list, loss_D_list, f"{out_dir}/loss.png")
-    save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
-                     f"{out_dir}/samples_grid.png", n_samples=30)
-    plot_comparison(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/comparison.png")
-    plot_interpolation(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/interpolation.png")
-    save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
-                     f"{out_dir}/samples/final.png", n_samples=20)
-    print("Plotting PCA of encoder and decoder...")
-    plot_pca_encoder_decoder(G, cond_encoder, train_loader, latent_dim, device, out_dir)
-
-    print(f"Done. Outputs saved to {out_dir}/")
+            cond = cond.view(cond.size(0), -1)
+            encoded_conds.append(cond.detach().cpu().numpy())
+            labels_l.append(target_labels.detach().cpu().numpy())
+            actions_l.append(actions.detach().cpu().numpy())
+    pca = PCA(n_components=2)
+    pca.fit(np.concatenate(encoded_conds, axis=0))
+    cond_pca = pca.transform(np.concatenate(encoded_conds, axis=0))
+    fig, axs = plt.subplots(1,2, figsize=(10, 5))
+    im = axs[0].scatter(cond_pca[:, 0], cond_pca[:, 1], c=np.concatenate(labels_l, axis=0), cmap='coolwarm', alpha=0.7)
+    cbar = plt.colorbar(im, ax=axs[0])
+    cbar.set_label('Target Label')
+    axs[0].set_xlabel(f'PCA Component 1 ({100*pca.explained_variance_ratio_[0]:.2f}%)')
+    axs[0].set_ylabel(f'PCA Component 2 ({100*pca.explained_variance_ratio_[1]:.2f}%)')
+    axs[0].set_title('PCA of Encoded Conditions Colored by Target Label')
+    plt.tight_layout()
+    im = axs[1].scatter(cond_pca[:, 0], cond_pca[:, 1], c=np.concatenate(actions_l, axis=0), cmap='coolwarm', alpha=0.7)
+    cbar = plt.colorbar(im, ax=axs[1])
+    cbar.set_label('Action')
+    axs[1].set_xlabel(f'PCA Component 1 ({100*pca.explained_variance_ratio_[0]:.2f}%)')
+    axs[1].set_ylabel(f'PCA Component 2 ({100*pca.explained_variance_ratio_[1]:.2f}%)')
+    axs[1].set_title('PCA of Encoded Conditions Colored by Action')
+    plt.tight_layout()
+    fig.savefig(save_path)
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def train_and_vis(save_checkpoint_path=None):
+def main():
     latent_dim = 100
     batch_size = 128
     epochs = 30
@@ -596,15 +414,10 @@ def train_and_vis(save_checkpoint_path=None):
     A = 5  # action range [-A, A]
     cond_dim = 128
     cond_hidden = 256
-    config = get_config(
-        latent_dim=latent_dim,
-        batch_size=batch_size,
-        epochs=epochs,
-        lr=lr,
-        A=A,
-        cond_dim=cond_dim,
-        cond_hidden=cond_hidden,
-    )
+
+    torch.manual_seed(1)
+    random.seed(1)
+    np.random.seed(1)
 
     out_dir = "figures_cDCGAN"
     os.makedirs(out_dir, exist_ok=True)
@@ -645,40 +458,10 @@ def train_and_vis(save_checkpoint_path=None):
     plot_interpolation(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/interpolation.png")
     save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
                      f"{out_dir}/samples/final.png", n_samples=20)
-    print("Plotting PCA of encoder and decoder...")
-    plot_pca_encoder_decoder(G, cond_encoder, train_loader, latent_dim, device, out_dir)
-
-    if save_checkpoint_path:
-        save_checkpoint(G, D, cond_encoder, config, loss_G_list, loss_D_list, save_checkpoint_path)
+    plot_cond_pca(cond_encoder, train_loader, device, f"{out_dir}/cond_pca.png")
 
     print(f"Done. Outputs saved to {out_dir}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="cDCGAN: train or visualize from checkpoint")
-    parser.add_argument(
-        "--visualize-only",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="Load checkpoint and run visualizations only (no training)",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="checkpoints/cdcgan.pt",
-        metavar="PATH",
-        help="Path to save checkpoint after training (default: checkpoints/cdcgan.pt)",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=str,
-        default=None,
-        help="Output directory for visualizations (used with --visualize-only)",
-    )
-    args = parser.parse_args()
-
-    if args.visualize_only:
-        visualize_only(args.visualize_only, out_dir=args.out_dir)
-    else:
-        train_and_vis(save_checkpoint_path=args.checkpoint)
+    main()

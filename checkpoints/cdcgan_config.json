@@ -1,0 +1,10 @@
+{
+  "latent_dim": 100,
+  "batch_size": 128,
+  "epochs": 30,
+  "lr": 0.0002,
+  "A": 5,
+  "cond_dim": 128,
+  "cond_hidden": 256,
+  "action_dim": 11
+}
