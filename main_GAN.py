@@ -12,6 +12,7 @@ from torchvision import transforms
 from torch import optim
 from torchvision.utils import make_grid, save_image
 from sklearn.decomposition import PCA
+from sklearn.metrics.pairwise import euclidean_distances
 
 import os
 
@@ -93,35 +94,41 @@ class Encoder(nn.Module):
     Input: cond = concat(real_imgs, action_onehot)
     """
 
-    def __init__(self, image_dim: int, action_dim: int, encoder_dim: int = 256, hidden_dim: int = 1024):
+    def __init__(self, input_dim: int = 256, hidden_dim: int = 1024, output_dim: int = 64):
         super().__init__()
-        self.image_encoder = nn.Sequential(
-            nn.Linear(image_dim, hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(True),
+        img_dim = input_dim[0]
+        action_dim = input_dim[1]
+        self.conv = nn.Sequential(
+            nn.Unflatten(1, (1, 28, 28)),
+            nn.Conv2d(1, 32, 4, 2, 1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 64, 4, 2, 1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 128, 4, 2, 1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 256, 3, 1, 0),
+            nn.LeakyReLU(0.2),
         )
-        self.action_encoder = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(True)
-        )
-        self.combined_encoder = nn.Sequential(
-            nn.Linear(hidden_dim*2, hidden_dim),
-            nn.ReLU(True),
-            nn.Linear(hidden_dim, encoder_dim),
-            nn.ReLU(True),
-        )
-        self.encoder_dim = encoder_dim
+        conv_out_dim = 256
 
-    def forward(self, image: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        image_features = self.image_encoder(image)
-        action_features = self.action_encoder(action)
-        combined = torch.cat([image_features, action_features], dim=1)
-        return self.combined_encoder(combined)  # [B, encoder_dim]
+        self.mlp = nn.Sequential(
+            nn.Linear(conv_out_dim+action_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LeakyReLU(0.2),
+        )
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        img = cond[0]
+        action = cond[1]
+        img_features = self.conv(img)
+        img_features = img_features.view(img_features.size(0), -1)
+        combined = torch.cat([img_features, action], dim=1)
+        return self.mlp(combined)
 
 
 class Decoder(nn.Module):
@@ -130,42 +137,61 @@ class Decoder(nn.Module):
     Returns (x_fake, h_decoder) where h_decoder is the prev-to-last layer activation for PCA.
     """
 
-    def __init__(self, encoder_dim: int, image_dim: int, hidden_dim: int = 1024):
+    def __init__(self, encoder_dim: int, image_dim: int, noise_dim: int = 64, hidden_dim: int = 1024):
         super().__init__()
-        dec_in = encoder_dim
+        self.noise_dim = noise_dim
+        dec_in = encoder_dim + noise_dim  # <- encoder features + noise
+
         self.mlp = nn.Sequential(
             nn.Linear(dec_in, hidden_dim),
-            nn.ReLU(True),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(True),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
         )
         self.fc_out = nn.Sequential(
             nn.Linear(hidden_dim, image_dim),
             nn.Tanh(),
         )
 
-    def forward(self, h_encoder: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.mlp(h_encoder)  # h_decoder = prev-to-last
+    def forward(self, h_encoder: torch.Tensor, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # h_encoder: [B, encoder_dim], z: [B, noise_dim]
+        h_in = torch.cat([h_encoder, z], dim=1)
+        h = self.mlp(h_in)   # h_decoder = prev-to-last
         x_fake = self.fc_out(h)
         return x_fake, h
+
 
 
 class Discriminator(nn.Module):
     """Discriminator: (x_candidate) -> real/fake logits."""
 
-    def __init__(self, image_dim: int, hidden_dim: int = 1024):
+    def __init__(self, image_dim: int, hidden_dim: int = 1024, cond_dim: int = 10, encoder_dim: int = 64):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(image_dim, hidden_dim),
+            nn.Linear(image_dim + encoder_dim, hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
         )
-        self.fc_out = nn.Linear(hidden_dim // 2, 11)
+        # self.cond_encoder = nn.Embedding(10, 10)
+        self.cond_encoder = Encoder(cond_dim, hidden_dim, encoder_dim)
+        self.fc_out = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc_out(self.mlp(x))
-
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h_encoder = self.cond_encoder(cond)
+        combined = torch.cat([x, h_encoder], dim=1)
+        x_features = self.mlp(combined)
+        return self.fc_out(x_features)
+    
 
 class ConditionalGAN(nn.Module):
     """
@@ -173,28 +199,61 @@ class ConditionalGAN(nn.Module):
     Generator = Encoder + Decoder. Encoder(cond) -> h_encoder; Decoder(h_encoder, noise) -> x_fake.
     """
 
-    def __init__(self, image_dim: int, action_dim: int, encoder_dim: int = 256, hidden_dim: int = 1024):
+    def __init__(
+        self,
+        image_dim: int,
+        cond_dim: int = 10,
+        encoder_dim: int = 256,
+        noise_dim: int = 64,
+        hidden_dim: int = 1024,
+    ):
         super().__init__()
-        self.encoder = Encoder(image_dim, action_dim, encoder_dim, hidden_dim)
-        self.decoder = Decoder(encoder_dim, image_dim, hidden_dim)
+        # self.encoder = Encoder(image_dim, action_dim, encoder_dim, hidden_dim)
+        # self.encoder = nn.Embedding(self.cond_dim, encoder_dim)
+        self.cond_encoder = Encoder(cond_dim, hidden_dim, encoder_dim)
+        self.decoder = Decoder(encoder_dim, image_dim, noise_dim, hidden_dim)
+        self.noise_dim = noise_dim
 
-    def forward(self, real_imgs: torch.Tensor, action_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (x_fake, h_encoder, h_decoder) for PCA."""
-        h_encoder = self.encoder(real_imgs, action_obs)
-        x_fake, h_decoder = self.decoder(h_encoder)
+    def forward(
+        self,
+        cond,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns (x_fake, h_encoder, h_decoder) for PCA.
+        This samples a fresh z each call.
+        cond: [real_imgs, action_obs] or tensor
+        """
+        B = cond[0].size(0) if isinstance(cond, (list, tuple)) else cond.size(0)
+        h_encoder = self.cond_encoder(cond)
+        dev = cond[0].device if isinstance(cond, (list, tuple)) else cond.device
+        z = torch.randn(B, self.noise_dim, device=dev)
+        x_fake, h_decoder = self.decoder(h_encoder, z)
         return x_fake, h_encoder, h_decoder
 
-    def generate(self, real_imgs: torch.Tensor, action_obs: torch.Tensor, n_samples: int = 1) -> torch.Tensor:
-        cond = torch.cat([real_imgs, action_obs], dim=1)
-        B = real_imgs.size(0)
+    def generate(
+        self,
+        cond: torch.Tensor,
+        n_samples: int = 1,
+    ) -> torch.Tensor:
+        """
+        For each (real_img, action), generate n_samples with different z.
+        Output shape: [n_samples, B, image_dim] if n_samples > 1, else [B, image_dim].
+        """
+        B = cond[0].size(0) if isinstance(cond, (list, tuple)) else cond.size(0)
+        dev = cond[0].device if isinstance(cond, (list, tuple)) else cond.device
         samples = []
         with torch.no_grad():
+            # Encode once, reuse h_encoder for all z’s
+            h_encoder = self.cond_encoder(cond)
             for _ in range(n_samples):
-                x_fake, _, _ = self.forward(real_imgs, action_obs)
+                z = torch.randn(B, self.noise_dim, device=dev)
+                x_fake, _ = self.decoder(h_encoder, z)
                 samples.append(x_fake)
+
         if n_samples == 1:
-            return samples[0]
-        return torch.stack(samples, dim=0)
+            return samples[0]  # [B, image_dim]
+        return torch.stack(samples, dim=0)  # [n_samples, B, image_dim]
+
 
 
 if __name__ == "__main__":
@@ -205,7 +264,7 @@ if __name__ == "__main__":
     # Increase A for more interesting "action -> target digit" transitions.
     # Set A=0 to make target always match the source digit.
     
-    for A in [0, 1, 5, 9]:
+    for A in [5]:
         print(f"Running for A={A}")
         base_folder = f"figures_GAN/A_{A}"
         os.makedirs(base_folder, exist_ok=True)
@@ -227,90 +286,59 @@ if __name__ == "__main__":
         # fig.colorbar(im, ax=axs[1])
         # plt.show()
 
-        encoder_dim = 256
+        encoder_dim = 128
+        noise_dim = 100  # you can tune this
+        cond_dim = [image.shape[0], one_hot_action.shape[0]]
+        
         G = ConditionalGAN(
             image_dim=image.shape[0],
-            action_dim=one_hot_action.shape[0],
+            cond_dim=cond_dim,
             encoder_dim=encoder_dim,
+            noise_dim=noise_dim,
             hidden_dim=1024,
         ).to(device)
         D = Discriminator(
             image_dim=image.shape[0],
             hidden_dim=1024,
+            cond_dim=cond_dim,
+            encoder_dim=encoder_dim,
         ).to(device)
 
         # ----------------------------
         # Hyperparameters
         # ----------------------------
         lr = 2e-4
-        epochs = 50
-        batch_size = 1024
+        epochs = 30
+        batch_size = 128
 
         train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.BCEWithLogitsLoss()
         criterion_rec = nn.L1Loss()
 
-        lambda_rec = 0.1
-        label_smoothing_real = 0.9
+        # lambda_rec = 10.0
 
         opt_G = optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
-        opt_D = optim.Adam(D.parameters(), lr=lr/10, betas=(0.5, 0.999))
+        opt_D = optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
+
 
         loss_D_l = []
-        loss_G_rec_l = []
-        loss_G_cls_l = []
+        loss_G_l = []
+
+        def get_cond(real_imgs, labels, target_imgs, target_labels, actions, action_obs):
+            # cond = torch.cat([real_imgs, action_obs], dim=1)
+            cond = [real_imgs, action_obs]
+            # cond = target_labels
+            return cond
 
         for epoch in range(1, epochs + 1):
-            loss_D_epoch = 0
-            loss_G_rec_epoch = 0
-            loss_G_cls_epoch = 0
-
-            for real_imgs, labels, target_imgs, target_labels, actions, action_obs in train_loader:
-                real_imgs = real_imgs.to(device)
-                labels = labels.to(device)
-                target_imgs = target_imgs.to(device)
-                target_labels = target_labels.to(device)
-                actions = actions.to(device).float()
-                action_obs = action_obs.to(device)
-                B = real_imgs.size(0)
-
-                # ---- Discriminator update ----
-                x_fake, _, _ = G(real_imgs, action_obs)
-                D_real = D(target_imgs)
-                D_fake = D(x_fake.detach())
-
-                L_D = criterion(D_real, target_labels) + criterion(D_fake, torch.ones_like(target_labels)*10)
-
-                opt_D.zero_grad()
-                L_D.backward()
-                opt_D.step()
-
-                # ---- Generator update ----
-                x_fake, h_encoder, h_decoder = G(real_imgs, action_obs)
-                D_fake = D(x_fake)
-                L_G_rec = criterion_rec(x_fake, target_imgs)
-                L_G_cls = criterion(D_fake, target_labels)
-                L_G = L_G_cls + lambda_rec * L_G_rec
-
-                opt_G.zero_grad()
-                L_G.backward()
-                opt_G.step()
-
-                loss_D_epoch += L_D.item()
-                loss_G_rec_epoch += L_G_rec.item()
-                loss_G_cls_epoch += L_G_cls.item()
-
-            loss_D_l.append(loss_D_epoch / len(train_loader))
-            loss_G_rec_l.append(loss_G_rec_epoch / len(train_loader))
-            loss_G_cls_l.append(loss_G_cls_epoch / len(train_loader))
-            print(f"Epoch {epoch:03d} | D: {loss_D_l[-1]:.4f} | G_rec: {loss_G_rec_l[-1]:.4f} | G_cls: {loss_G_cls_l[-1]:.4f}")
 
             
             with torch.no_grad():
                 batch_vis = next(iter(train_loader))
-                rv, lv, tv, tl_v, av, ao_v = [x.to(device) for x in batch_vis]
-                x_fake_vis, _, _ = G(rv, ao_v)
+                real_imgs, labels, target_imgs, target_labels, actions, action_obs = [x.to(device) for x in batch_vis]
+                cond = get_cond(real_imgs, labels, target_imgs, target_labels, actions, action_obs)
+                x_fake_vis, _, _ = G(cond)
                 recons = x_fake_vis.view(-1, 28, 28).cpu().numpy()
 
             # Samples: source | target | G(source, action, noise)
@@ -324,10 +352,10 @@ if __name__ == "__main__":
                     axs[0].set_ylabel(f's: {labels[idx].item()}, s_next: {target_labels[idx].item()}, a: {actions[idx].item()}')
 
                     axs[1].imshow(target_imgs[idx].reshape(28, 28).cpu().numpy(), cmap='gray')
-                    axs[1].set_title("target")
+                    axs[1].set_title("Target")
 
                     axs[2].imshow(recons[idx], cmap='gray')
-                    axs[2].set_title("G(source, action, noise)")
+                    axs[2].set_title("Generated")
 
                     axs[0].axis('off')
                     axs[1].axis('off')
@@ -336,6 +364,55 @@ if __name__ == "__main__":
             fig.tight_layout()
             plt.savefig(f"{base_folder}/samples/samples_epoch_{epoch:03d}.png")
             plt.close()
+
+            loss_D_epoch = 0
+            loss_G_epoch = 0
+
+            for real_imgs, labels, target_imgs, target_labels, actions, action_obs in train_loader:
+                real_imgs = real_imgs.to(device)
+                labels = labels.to(device)
+                target_imgs = target_imgs.to(device)
+                target_labels = target_labels.to(device)
+                actions = actions.to(device).float()
+                action_obs = action_obs.to(device)
+                B = real_imgs.size(0)
+
+                cond = get_cond(real_imgs, labels, target_imgs, target_labels, actions, action_obs)
+
+                # ---- Discriminator update ----
+                x_fake, _, _ = G(cond)
+                D_real = D(target_imgs, cond)
+                D_fake = D(x_fake.detach(), cond)
+
+                labels_fake = torch.zeros_like(D_fake).float()
+                labels_real = torch.ones_like(D_real).float()
+
+                L_D_fake = criterion(D_fake, labels_fake)
+                L_D_real = criterion(D_real, labels_real)
+                L_D = L_D_fake + L_D_real
+
+                opt_D.zero_grad()
+                L_D.backward()
+                opt_D.step()
+
+                # ---- Generator update ----
+                x_fake, h_encoder, h_decoder = G(cond)
+                D_fake = D(x_fake, cond)
+                # L_G_rec = criterion_rec(x_fake, target_imgs)
+                # L_G_cls = criterion(D_fake, labels_real)
+                # L_G = L_G_cls + lambda_rec * L_G_rec
+                L_G = criterion(D_fake, labels_real)
+
+                opt_G.zero_grad()
+                L_G.backward()
+                opt_G.step()
+
+                loss_D_epoch += L_D.item()
+                loss_G_epoch += L_G.item()
+
+            loss_D_l.append(loss_D_epoch / len(train_loader))
+            loss_G_l.append(loss_G_epoch / len(train_loader))
+            print(f"Epoch {epoch:03d} | D: {loss_D_l[-1]:.4f} | G: {loss_G_l[-1]:.4f}")
 
         # Collect encoder/decoder hidden states for PCA
         with torch.no_grad():
@@ -351,7 +428,8 @@ if __name__ == "__main__":
                 actions = actions.to(device).float()
                 action_obs = action_obs.to(device)
 
-                x_fake, h_encoder, h_decoder = G(real_imgs, action_obs)
+                cond = get_cond(real_imgs, labels, target_imgs, target_labels, actions, action_obs)
+                x_fake, h_encoder, h_decoder = G(cond)
 
                 hidden_encoder_l.append(h_encoder.detach().cpu().numpy())
                 hidden_decoder_l.append(h_decoder.detach().cpu().numpy())
@@ -360,18 +438,16 @@ if __name__ == "__main__":
 
             # For samples figure
             batch_vis = next(iter(train_loader))
-            rv, lv, tv, tl_v, av, ao_v = [x.to(device) for x in batch_vis]
-            x_fake_vis, _, _ = G(rv, ao_v)
+            real_imgs, labels, target_imgs, target_labels, actions, action_obs = [x.to(device) for x in batch_vis]
+            cond = get_cond(real_imgs, labels, target_imgs, target_labels, actions, action_obs)
+            x_fake_vis, _, _ = G(cond)
             recons = x_fake_vis.view(-1, 28, 28).cpu().numpy()
-            real_imgs, labels, target_imgs, target_labels, actions = rv, lv, tv, tl_v, av
-            action_obs = ao_v
 
         print('Finished training, plotting loss, PCA and samples...')
 
         fig, ax = plt.subplots(figsize=(7, 3))
         ax.plot(loss_D_l, label='loss_D')
-        ax.plot(loss_G_rec_l, label='loss_G_rec')
-        ax.plot(loss_G_cls_l, label='loss_G_cls')
+        ax.plot(loss_G_l, label='loss_G')
         plt.yscale('log')
         ax.legend()
         plt.savefig(f"{base_folder}/loss.png")
@@ -385,13 +461,12 @@ if __name__ == "__main__":
             for i in range(n):
                 axs = axs_all[i, j*3:(j+1)*3]
                 axs[0].imshow(real_imgs[idx].reshape(28, 28).cpu().numpy(), cmap='gray')
-                axs[0].set_ylabel(f's: {labels[idx].item()}, s_next: {target_labels[idx].item()}, a: {actions[idx].item()}')
 
                 axs[1].imshow(target_imgs[idx].reshape(28, 28).cpu().numpy(), cmap='gray')
-                axs[1].set_title("target")
+                axs[1].set_title("Target")
 
                 axs[2].imshow(recons[idx], cmap='gray')
-                axs[2].set_title("G(source, action, noise)")
+                axs[2].set_title("Generated")
 
                 axs[0].axis('off')
                 axs[1].axis('off')
@@ -412,7 +487,8 @@ if __name__ == "__main__":
             labels = labels[:n_conds]
             target_labels = target_labels[:n_conds]
             actions = actions[:n_conds]
-            samples_prior = G.generate(real_imgs, action_obs, n_samples=K)
+            cond = get_cond(real_imgs, labels, target_imgs, target_labels, actions, action_obs)
+            samples_prior = G.generate(cond, n_samples=K)
 
         fig, axs_all = plt.subplots(n_conds, 2 + K, figsize=(2*(2+K), 2*n_conds))
         for i in range(n_conds):
@@ -516,3 +592,34 @@ if __name__ == "__main__":
             plt.tight_layout()
             fig.savefig(f"{base_folder}/pca_centers/pca_{var_name}_a0_centers.png")
             plt.close()
+
+        # Distance matrices: hidden states ordered by target label
+        hidden_encoder_np = np.concatenate(hidden_encoder_l, axis=0)
+        hidden_decoder_np = np.concatenate(hidden_decoder_l, axis=0)
+        label_np = np.concatenate(target_label_l, axis=0)
+        sort_idx = np.argsort(label_np)
+        hidden_encoder_sorted = hidden_encoder_np[sort_idx]
+        hidden_decoder_sorted = hidden_decoder_np[sort_idx]
+        # Subsample for memory (full 60k x 60k would be ~28GB)
+        max_samples_dist = 5000
+        if len(hidden_encoder_sorted) > max_samples_dist:
+            step = len(hidden_encoder_sorted) // max_samples_dist
+            idx_sub = np.arange(0, len(hidden_encoder_sorted), step)[:max_samples_dist]
+            hidden_encoder_sorted = hidden_encoder_sorted[idx_sub]
+            hidden_decoder_sorted = hidden_decoder_sorted[idx_sub]
+        dist_encoder = euclidean_distances(hidden_encoder_sorted)
+        dist_decoder = euclidean_distances(hidden_decoder_sorted)
+        fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+        im0 = axs[0].imshow(dist_encoder, cmap='viridis', aspect='auto')
+        axs[0].set_title('Encoder hidden states (ordered by target label)')
+        axs[0].set_xlabel('Sample index')
+        axs[0].set_ylabel('Sample index')
+        plt.colorbar(im0, ax=axs[0], label='Euclidean distance')
+        im1 = axs[1].imshow(dist_decoder, cmap='viridis', aspect='auto')
+        axs[1].set_title('Decoder hidden states (ordered by target label)')
+        axs[1].set_xlabel('Sample index')
+        axs[1].set_ylabel('Sample index')
+        plt.colorbar(im1, ax=axs[1], label='Euclidean distance')
+        fig.tight_layout()
+        fig.savefig(f"{base_folder}/distance_matrix.png")
+        plt.close()
