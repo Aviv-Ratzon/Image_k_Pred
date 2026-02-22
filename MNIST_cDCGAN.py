@@ -4,8 +4,11 @@ Conditioned on (source image, action) from MNISTActionDataset.
 Uses a ConditionEncoder (CNN + FCN) to encode the conditioning inputs.
 """
 
+import itertools
+import multiprocessing as mp
 import random
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,11 +17,73 @@ import torchvision
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import os
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------------------------------------------------------------------
+# Pretrained MNIST Classifier
+# ---------------------------------------------------------------------------
+class MNISTClassifier(nn.Module):
+    """Simple CNN classifier for 28x28 grayscale MNIST. Expects input normalized to [-1, 1]."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 7 * 7, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(128, 10),
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+def get_pretrained_mnist_classifier(device, checkpoint_path="checkpoints/mnist_classifier_cdcgan.pt"):
+    """Load pretrained MNIST classifier, training it first if checkpoint does not exist."""
+    d = os.path.dirname(checkpoint_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    classifier = MNISTClassifier().to(device)
+    if os.path.isfile(checkpoint_path):
+        classifier.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        classifier.eval()
+        print(f"Loaded pretrained classifier from {checkpoint_path}")
+        return classifier
+    # Train classifier
+    print(f"Training MNIST classifier (saving to {checkpoint_path})...")
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
+    train_ds = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
+    opt = optim.Adam(classifier.parameters(), lr=1e-3)
+    classifier.train()
+    for epoch in range(10):
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            opt.zero_grad()
+            logits = classifier(batch_x)
+            loss = nn.functional.cross_entropy(logits, batch_y)
+            loss.backward()
+            opt.step()
+    classifier.eval()
+    torch.save(classifier.state_dict(), checkpoint_path)
+    print(f"Saved classifier to {checkpoint_path}")
+    return classifier
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +97,7 @@ class MNISTActionDataset(torch.utils.data.Dataset):
         self.cyclic = cyclic
         self.transform = transform
         self.action_dim = 2 * A + 1
+        self.only_zero_action = False
         self.onehot = lambda x: torch.eye(self.action_dim)[x + A].float()
 
         self.dataset = torchvision.datasets.MNIST(
@@ -40,12 +106,11 @@ class MNISTActionDataset(torch.utils.data.Dataset):
         self.data_idx_by_class = {i: [] for i in range(10)}
         self.images = []
         self.labels = []
-        self.group_idx = []
         for idx, (image, label) in enumerate(self.dataset):
-            self.group_idx.append(len(self.data_idx_by_class[label]))
             self.data_idx_by_class[label].append(idx)
             self.images.append(image)
             self.labels.append(label)
+        self._class_size = [len(self.data_idx_by_class[c]) for c in range(10)]
         print(f"MNISTActionDataset: A={A}, cyclic={cyclic}, samples={len(self.images)}")
 
     def __len__(self):
@@ -54,7 +119,10 @@ class MNISTActionDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         image = self.images[idx]
         label = self.labels[idx]
-        if self.cyclic:
+        if self.only_zero_action:
+            action = 0
+            target_label = label
+        elif self.cyclic:
             action = random.randint(-self.A, self.A)
             target_label = (label + action) % 10
         else:
@@ -63,9 +131,8 @@ class MNISTActionDataset(torch.utils.data.Dataset):
             )
             target_label = label + action
         action_obs = self.onehot(action)
-        target_image_idx = self.data_idx_by_class[target_label][
-            self.group_idx[idx] % len(self.data_idx_by_class[target_label])
-        ]
+        n = self._class_size[target_label]
+        target_image_idx = self.data_idx_by_class[target_label][random.randint(0, n - 1)]
         target_image = self.images[target_image_idx]
         return image, label, target_image, target_label, action, action_obs
 
@@ -127,8 +194,12 @@ class Generator(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.init_size = 7
-        self.fc = nn.Linear(latent_dim + cond_dim, 256 * self.init_size ** 2)
-
+        self.fc = nn.Sequential(nn.Linear(latent_dim + cond_dim, 1024), 
+                                nn.LeakyReLU(0.2),
+                                nn.Linear(1024, 1024),
+                                nn.LeakyReLU(0.2),
+                                nn.Linear(1024, 256 * self.init_size ** 2))
+                                
         self.conv_blocks = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 7 -> 14
             nn.BatchNorm2d(128),
@@ -149,28 +220,43 @@ class Generator(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Discriminator: (image, cond) -> real/fake logit
+# use_spectral_norm: applies spectral normalization to constrain Lipschitz constant (reduces mode collapse)
 # ---------------------------------------------------------------------------
+def _make_conv_layer(in_ch, out_ch, k, s, p, spectral_norm=False):
+    layer = nn.Conv2d(in_ch, out_ch, k, s, p)
+    if spectral_norm:
+        layer = nn.utils.spectral_norm(layer)
+    return layer
+
+
+def _make_linear_layer(in_feat, out_feat, spectral_norm=False):
+    layer = nn.Linear(in_feat, out_feat)
+    if spectral_norm:
+        layer = nn.utils.spectral_norm(layer)
+    return layer
+
+
 class Discriminator(nn.Module):
-    def __init__(self, cond_dim=128, cond_spatial_channels=16):
+    def __init__(self, cond_dim=128, cond_spatial_channels=16, use_spectral_norm=True):
         super().__init__()
         self.cond_dim = cond_dim
         self.cond_spatial_channels = cond_spatial_channels
-        self.cond_to_spatial = nn.Linear(cond_dim, cond_spatial_channels)
+        sn = use_spectral_norm
+        self.cond_to_spatial = _make_linear_layer(cond_dim, cond_spatial_channels, spectral_norm=sn)
         self.conv_blocks = nn.Sequential(
-            nn.Conv2d(1 + cond_spatial_channels, 64, 4, 2, 1),  # image + projected cond
+            _make_conv_layer(1 + cond_spatial_channels, 64, 4, 2, 1, spectral_norm=sn),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, 4, 2, 1),
+            _make_conv_layer(64, 128, 4, 2, 1, spectral_norm=sn),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 256, 4, 2, 1),
+            _make_conv_layer(128, 256, 4, 2, 1, spectral_norm=sn),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(256, 512, 3, 1, 0),
+            _make_conv_layer(256, 512, 3, 1, 0, spectral_norm=sn),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2),
         )
-        # Conv output is 512*1*1; concat cond for final fc
-        self.fc = nn.Linear(512 + cond_dim, 1)
+        self.fc = _make_linear_layer(512 + cond_dim, 1, spectral_norm=sn)
 
     def forward(self, img, cond):
         # Project cond to spatial channels and broadcast
@@ -187,6 +273,10 @@ class Discriminator(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Training
+# Anti-mode-collapse options:
+#   label_smooth_real, label_smooth_fake: soften targets (e.g., 0.9, 0.0) to prevent overconfident D
+#   instance_noise_std: add Gaussian noise to D inputs (helps early exploration, hinders mode collapse)
+#   instance_noise_decay: per-epoch decay factor (0.99 = slow, 0.9 = faster decay toward zero)
 # ---------------------------------------------------------------------------
 def train_cdcgan(
     G, D, cond_encoder,
@@ -198,6 +288,10 @@ def train_cdcgan(
     epochs=30,
     log_interval=100,
     sample_dir=None,
+    label_smooth_real=0.9,
+    label_smooth_fake=0.0,
+    instance_noise_std=0.1,
+    instance_noise_decay=0.99,
 ):
     G.train()
     D.train()
@@ -207,14 +301,16 @@ def train_cdcgan(
     for epoch in range(1, epochs + 1):
         loss_G_epoch, loss_D_epoch = 0.0, 0.0
         n_batches = 0
+        # Decay instance noise over epochs (higher early, lower late)
+        noise_std = instance_noise_std * (instance_noise_decay ** (epoch - 1)) if instance_noise_std > 0 else 0.0
 
         for batch_idx, batch in enumerate(train_loader):
             (source_imgs, labels, target_imgs, target_labels, actions, action_obs) = [
                 x.to(device) for x in batch
             ]
             B = source_imgs.size(0)
-            real_valid = torch.ones(B, 1, device=device)
-            fake_valid = torch.zeros(B, 1, device=device)
+            real_valid = torch.full((B, 1), label_smooth_real, device=device)
+            fake_valid = torch.full((B, 1), label_smooth_fake, device=device)
 
             # ----- Train Discriminator -----
             opt_D.zero_grad()
@@ -222,8 +318,12 @@ def train_cdcgan(
             z = torch.randn(B, latent_dim, device=device)
             fake_imgs = G(z, cond)
 
-            D_real = D(target_imgs, cond)
-            D_fake = D(fake_imgs.detach(), cond)
+            # Instance noise: add to inputs before D (helps prevent mode collapse)
+            real_in = target_imgs + noise_std * torch.randn_like(target_imgs, device=device) if noise_std > 0 else target_imgs
+            fake_in = fake_imgs.detach() + noise_std * torch.randn_like(fake_imgs, device=device) if noise_std > 0 else fake_imgs.detach()
+
+            D_real = D(real_in, cond)
+            D_fake = D(fake_in, cond)
 
             loss_D_real = criterion(D_real, real_valid)
             loss_D_fake = criterion(D_fake, fake_valid)
@@ -237,7 +337,8 @@ def train_cdcgan(
             cond = cond_encoder(source_imgs, action_obs)
             z = torch.randn(B, latent_dim, device=device)
             fake_imgs = G(z, cond)
-            D_fake = D(fake_imgs, cond)
+            fake_in_g = fake_imgs + noise_std * torch.randn_like(fake_imgs, device=device) if noise_std > 0 else fake_imgs
+            D_fake = D(fake_in_g, cond)
             loss_G = criterion(D_fake, real_valid)
 
             loss_G.backward()
@@ -247,10 +348,10 @@ def train_cdcgan(
             loss_D_epoch += loss_D.item()
             n_batches += 1
 
-            if (batch_idx + 1) % log_interval == 0:
-                print(f"  Epoch {epoch} [{batch_idx + 1}/{len(train_loader)}] "
-                      f"Loss_D: {loss_D_epoch / n_batches:.4f} "
-                      f"Loss_G: {loss_G_epoch / n_batches:.4f}")
+            # if (batch_idx + 1) % log_interval == 0:
+            #     print(f"  Epoch {epoch} [{batch_idx + 1}/{len(train_loader)}] "
+            #           f"Loss_D: {loss_D_epoch / n_batches:.4f} "
+            #           f"Loss_G: {loss_G_epoch / n_batches:.4f}")
 
         loss_G_list.append(loss_G_epoch / n_batches)
         loss_D_list.append(loss_D_epoch / n_batches)
@@ -401,25 +502,266 @@ def plot_cond_pca(cond_encoder, train_loader, device, save_path):
     plt.tight_layout()
     fig.savefig(save_path)
     plt.close()
+    cond_encoder.train()
+
+
+def save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, save_path, n_samples=40):
+    cond_encoder.eval()
+    encoded_conds = []
+    labels_l = []
+    actions_l = []
+    with torch.no_grad():
+        for batch in train_loader:
+            source_imgs = batch[0].to(device)
+            actions = batch[4].to(device)
+            action_obs = batch[5].to(device)
+            target_labels = batch[3].to(device)
+            cond = cond_encoder(source_imgs, action_obs)
+            cond = cond.view(cond.size(0), -1)
+            encoded_conds.append(cond.detach().cpu().numpy())
+            labels_l.append(target_labels.detach().cpu().numpy())
+            actions_l.append(actions.detach().cpu().numpy())
+    pca = PCA(n_components=2)
+    pca.fit(np.concatenate(encoded_conds, axis=0))
+    cond_pca = pca.transform(np.concatenate(encoded_conds, axis=0))
+
+    # Generate n_samples points along the first PC axis of cond_pca,
+    # ranging from the minimum to the maximum projection of the original conditions
+    # Use the mean of the other PCs for each point
+
+    # Find min and max along PC1
+    pc1_vals = cond_pca[:, 0]
+    pc2_mean = np.mean(cond_pca[:, 1])
+
+    pc1_min = np.min(pc1_vals)
+    pc1_max = np.max(pc1_vals)
+    pc1_points = np.linspace(pc1_min, pc1_max, n_samples)
+    pca_points = np.stack([pc1_points, np.full(n_samples, pc2_mean)], axis=1)
+
+    # Map these points back to the encoded condition space
+    pca_inv = pca.inverse_transform(pca_points)  # shape (n_samples, cond_dim)
+
+    """Save grid: source | target | generated for random batch conditions."""
+    G.eval()
+    cond = torch.tensor(pca_inv, dtype=torch.float32, device=device)
+    z = torch.randn(n_samples, latent_dim, device=device)
+    fake_imgs = G(z, cond)
+
+    grid = make_grid(fake_imgs, nrow=10, normalize=True, padding=2)
+    save_image(grid, save_path)
+    G.train()
+    cond_encoder.train()
+
+def save_trial_statistics(G, cond_encoder, train_loader, latent_dim, device, save_path, classifier=None):
+    """Compute and save Participation Ratio, R^2(target label vs first n PCs), and classifier accuracy on generated images."""
+    cond_encoder.eval()
+    G.eval()
+    encoded_conds = []
+    target_labels_l = []
+    with torch.no_grad():
+        for batch in train_loader:
+            source_imgs = batch[0].to(device)
+            action_obs = batch[5].to(device)
+            target_labels = batch[3]
+            cond = cond_encoder(source_imgs, action_obs)
+            cond = cond.view(cond.size(0), -1)
+            encoded_conds.append(cond.detach().cpu().numpy())
+            target_labels_l.append(target_labels.numpy())
+    cond_encoder.train()
+    G.train()
+
+    X = np.concatenate(encoded_conds, axis=0)
+    y = np.concatenate(target_labels_l, axis=0).astype(np.float64).reshape(-1, 1)
+
+    # Participation Ratio: PR = (sum λ_i)^2 / sum(λ_i^2) from covariance eigenvalues
+    X_centered = X - X.mean(axis=0)
+    cov = np.cov(X_centered.T)
+    eigenvalues = np.linalg.eigvalsh(cov)
+    eigenvalues = np.sort(eigenvalues)[::-1]  # descending
+    eigenvalues = np.maximum(eigenvalues, 0)  # numerical safety
+    participation_ratio = (np.sum(eigenvalues) ** 2) / (np.sum(eigenvalues ** 2) + 1e-10)
+
+    # R^2 between first n PCs and target label, for n = 1..30
+    n_pcs_max = min(30, X.shape[0] - 1, X.shape[1])
+    pca = PCA(n_components=n_pcs_max)
+    X_pca = pca.fit_transform(X_centered)
+    n_l = [n for n in range(1, n_pcs_max + 1)]
+    r2_per_n = []
+    for n in n_l:
+        X_n = X_pca[:, :n]
+        reg = LinearRegression().fit(X_n, y.ravel())
+        r2 = reg.score(X_n, y.ravel())
+        r2_per_n.append((n, r2))
+
+    # Classifier accuracy on generated images
+    classifier_accuracy = None
+    if classifier is not None:
+        classifier.eval()
+        cond_encoder.eval()
+        G.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for batch in train_loader:
+                source_imgs = batch[0].to(device)
+                action_obs = batch[5].to(device)
+                target_labels = batch[3].to(device)
+                cond = cond_encoder(source_imgs, action_obs)
+                z = torch.randn(source_imgs.size(0), latent_dim, device=device)
+                fake_imgs = G(z, cond)
+                pred = classifier(fake_imgs).argmax(dim=1)
+                correct += (pred == target_labels).sum().item()
+                total += target_labels.size(0)
+        classifier_accuracy = correct / total if total > 0 else 0.0
+        classifier.train()
+        cond_encoder.train()
+        G.train()
+
+    import pickle
+    stats = {
+        "participation_ratio": participation_ratio,
+        "r2_per_n": r2_per_n,
+        "n_l": n_l,
+        "classifier_accuracy": classifier_accuracy,
+    }
+    with open(save_path, "wb") as f:
+        pickle.dump(stats, f)
+    acc_str = f" (classifier acc: {classifier_accuracy:.4f})" if classifier_accuracy is not None else ""
+    print(f"Saved trial statistics to {save_path}{acc_str}")
+
+
+def plot_trial_statistics(base_folder):
+    """Load trial_statistics.pkl from each A_* / seed_* folder and plot R^2 vs n (line) and PR (boxplot)."""
+    import pickle
+    import glob
+
+    # Collect data: A_value -> list of {participation_ratio, r2_per_n}
+    data_by_A = {}
+    for A_dir in sorted(glob.glob(os.path.join(base_folder, "A_*"))):
+        if not os.path.isdir(A_dir):
+            continue
+        A_name = os.path.basename(A_dir)  # e.g. A_5
+        A_val = A_name.split("_")[1]  # e.g. "5"
+        data_by_A[A_val] = []
+        for seed_dir in sorted(glob.glob(os.path.join(A_dir, "seed_*"))):
+            if not os.path.isdir(seed_dir):
+                continue
+            pkl_path = os.path.join(seed_dir, "trial_statistics.pkl")
+            if not os.path.isfile(pkl_path):
+                continue
+            with open(pkl_path, "rb") as f:
+                stats = pickle.load(f)
+            print(stats["classifier_accuracy"])
+            if stats["classifier_accuracy"] < 0.3:
+                continue
+            stats['n_l'] = stats['n_l'][:15]
+            stats['r2_per_n'] = stats['r2_per_n'][:15]
+            data_by_A[A_val].append(stats)
+
+    if not data_by_A:
+        print(f"No trial_statistics.pkl found in {base_folder}")
+        return
+
+    A_vals_sorted = sorted(data_by_A.keys(), key=lambda x: int(x))
+    viridis = plt.colormaps["viridis"]
+    colors = [viridis(i / max(len(A_vals_sorted) - 1, 1)) for i in range(len(A_vals_sorted))]
+
+    fig, (ax_line, ax_box) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Line plot: R^2 vs n, one line per A (mean across seeds), Viridis gradient
+    for idx, A_val in enumerate(A_vals_sorted):
+        entries = data_by_A[A_val]
+        min_len = min(len(e["r2_per_n"]) for e in entries)
+        n_vals = np.array([entries[0]["r2_per_n"][i][0] for i in range(min_len)])
+        r2_matrix = np.array([[r2 for _, r2 in e["r2_per_n"][:min_len]] for e in entries])
+        r2_mean = r2_matrix.mean(axis=0)
+        r2_std = r2_matrix.std(axis=0)
+        c = colors[idx]
+        ax_line.plot(n_vals, r2_mean, label=f"A={A_val}", marker="o", markersize=3, color=c)
+        ax_line.fill_between(n_vals, r2_mean - r2_std, r2_mean + r2_std, alpha=0.2, color=c)
+    ax_line.set_xlabel("n (number of PCs)")
+    ax_line.set_ylabel("R² (target label)")
+    ax_line.set_title("R² vs first n PCs")
+    ax_line.legend()
+    ax_line.grid(True, alpha=0.3)
+
+    # Boxplot: Participation Ratio per A, Viridis gradient
+    pr_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
+    pr_values = [[e["participation_ratio"] for e in entries] for entries in pr_by_A]
+    A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
+    bp = ax_box.boxplot(pr_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
+        # Add number of samples as text above the box
+        n_samples = len(pr_values[i])
+        # Find the y position (top whisker)
+        whisker_y = bp['whiskers'][2 * i + 1].get_ydata()[1]
+        ax_box.text(i + 1, whisker_y + 0.05, f"n={n_samples}", ha='center', va='bottom', fontsize=9)
+    ax_box.set_ylabel("Participation Ratio")
+    ax_box.set_title("Participation Ratio by A")
+
+    plt.tight_layout()
+    out_path = os.path.join(base_folder, "trial_statistics_summary.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved {out_path}")
+
+
+
+    fig, (ax_box1, ax_box2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Boxplot: Maximal R² per run by A, Viridis gradient
+    max_r2_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
+    max_r2_values = [
+        [max([r2 for _, r2 in e["r2_per_n"]]) for e in entries] 
+        for entries in max_r2_by_A
+    ]
+    A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
+    bp = ax_box1.boxplot(max_r2_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
+    ax_box1.set_ylabel("Maximal R² (target label)")
+    ax_box1.set_title("Maximal R² by A")
+
+    # Boxplot: Participation Ratio per A, Viridis gradient
+    acc_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
+    acc_values = [[e["classifier_accuracy"] for e in entries] for entries in acc_by_A]
+    A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
+    bp = ax_box2.boxplot(acc_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
+    ax_box2.set_ylabel("Accuracy")
+    ax_box2.set_title("Accuracy by A")
+
+    plt.tight_layout()
+    out_path = os.path.join(base_folder, "trial_statistics_summary_2.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved {out_path}")
+
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
+def _run_single_task(args):
+    """Worker: train and visualize for one (A, seed) on assigned GPU. Runs in subprocess."""
+    task_idx, A, seed = args
+    num_gpus = 8
+    gpu_id = task_idx % num_gpus
+    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+
     latent_dim = 100
     batch_size = 128
     epochs = 30
     lr = 2e-4
-    A = 5  # action range [-A, A]
     cond_dim = 128
     cond_hidden = 256
 
-    torch.manual_seed(1)
-    random.seed(1)
-    np.random.seed(1)
+    torch.manual_seed(int(seed))
+    random.seed(int(seed))
+    np.random.seed(int(seed))
 
-    out_dir = "figures_cDCGAN"
+    out_dir = f"figures_cDCGAN/A_{A}/seed_{seed}"
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(f"{out_dir}/samples", exist_ok=True)
 
@@ -436,32 +778,63 @@ def main():
     D = Discriminator(cond_dim=cond_dim).to(device)
 
     criterion = nn.BCEWithLogitsLoss()
-    opt_G = optim.Adam(
+    opt_G = optim.AdamW(
         list(G.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
     )
-    opt_D = optim.Adam(
+    opt_D = optim.AdamW(
         list(D.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
     )
 
-    print("Training cDCGAN on MNISTActionDataset...")
+    # Anti-mode-collapse: spectral norm (in D), label smoothing, instance noise
+    print(f"[GPU {gpu_id}] A={A} seed={seed}: Training...")
     loss_G_list, loss_D_list = train_cdcgan(
         G, D, cond_encoder, train_loader, criterion, opt_G, opt_D,
         latent_dim=latent_dim, device=device, epochs=epochs,
         sample_dir=f"{out_dir}/samples",
+        label_smooth_real=0.9,
+        label_smooth_fake=0.0,
+        instance_noise_std=0.1,
+        instance_noise_decay=0.99,
     )
 
-    print("Saving visualizations...")
+    print(f"[GPU {gpu_id}] A={A} seed={seed}: Saving visualizations...")
     plot_loss(loss_G_list, loss_D_list, f"{out_dir}/loss.png")
     save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
-                     f"{out_dir}/samples_grid.png", n_samples=30)
+                      f"{out_dir}/samples_grid.png", n_samples=30)
     plot_comparison(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/comparison.png")
     plot_interpolation(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/interpolation.png")
     save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
-                     f"{out_dir}/samples/final.png", n_samples=20)
+                      f"{out_dir}/samples/final.png", n_samples=20)
     plot_cond_pca(cond_encoder, train_loader, device, f"{out_dir}/cond_pca.png")
+    save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples_grid_pca.png", n_samples=40)
+    classifier = get_pretrained_mnist_classifier(device)
+    dataset.only_zero_action = True
+    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    save_trial_statistics(G, cond_encoder, test_loader, latent_dim, device, f"{out_dir}/trial_statistics.pkl", classifier=classifier)
 
-    print(f"Done. Outputs saved to {out_dir}/")
+    print(f"[GPU {gpu_id}] A={A} seed={seed}: Done.")
+    return out_dir
+
+
+def main():
+    num_processes = 16
+    num_gpus = 8
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set
+    tasks = list(itertools.product(np.arange(10), np.arange(31,120)))
+    # Assign GPU: task_idx % 8 -> 2 processes per GPU
+    task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
+
+    print(f"Running {len(tasks)} tasks with {num_processes} processes across {num_gpus} GPUs")
+    with mp.Pool(num_processes) as pool:
+        pool.map(_run_single_task, task_args)
+    print("All tasks completed.")
+    plot_trial_statistics("figures_cDCGAN")
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    plot_trial_statistics("figures_cDCGAN")
+    # _run_single_task((0, 5, 1))

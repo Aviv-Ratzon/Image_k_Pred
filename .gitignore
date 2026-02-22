@@ -7,3 +7,17 @@ __pycache__/
 *.egg-info/
 .eggs/
 figures*/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.svg
+*.eps
+*.pdf
+*.pt
+data/
+runs/
