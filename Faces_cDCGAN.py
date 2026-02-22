@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 
@@ -400,6 +400,67 @@ def sample_grid(G, cond_emb, cfg: TrainConfig, fixed_z, fixed_y, epoch: int):
     G.train()
 
 
+def _age_group_label(cfg: TrainConfig, g: int) -> str:
+    # Equal-width bins over [0, max_age_for_norm]. Mirrors UTKFaceLikeDataset._age_to_group.
+    bin_w = cfg.max_age_for_norm / cfg.num_age_groups
+    lo = int(round(g * bin_w))
+    hi = int(round((g + 1) * bin_w))
+    if g == cfg.num_age_groups - 1:
+        hi = int(round(cfg.max_age_for_norm))
+    return f"group {g} ({lo}-{hi})"
+
+
+@torch.no_grad()
+def sample_agegroup_rows(G, cond_emb, cfg: TrainConfig, fixed_z, epoch: int, label_width: int = 140):
+    """
+    Saves a labeled grid:
+    - each row is a different age group (0..num_age_groups-1)
+    - columns are different random z's
+    """
+    if not cfg.use_age_groups:
+        raise ValueError("sample_agegroup_rows requires cfg.use_age_groups=True")
+
+    n_rows = cfg.num_age_groups
+    if cfg.fixed_n % n_rows != 0:
+        raise ValueError(f"fixed_n ({cfg.fixed_n}) must be divisible by num_age_groups ({n_rows})")
+    n_cols = cfg.fixed_n // n_rows
+
+    G.eval()
+    device = fixed_z.device
+    fixed_y_rows = torch.arange(n_rows, device=device).repeat_interleave(n_cols)
+    c = cond_emb(fixed_y_rows)
+    fake = G(fixed_z[: cfg.fixed_n], c)
+
+    pad = 2
+    grid_t = make_grid(
+        fake,
+        nrow=n_cols,
+        padding=pad,
+        normalize=True,
+        value_range=(-1, 1),
+    )
+
+    # grid_t is [3, H, W] in [0,1]; convert to PIL
+    grid_u8 = (grid_t.detach().cpu().clamp(0, 1) * 255).to(torch.uint8)
+    grid_img = Image.fromarray(grid_u8.permute(1, 2, 0).numpy(), mode="RGB")
+
+    canvas = Image.new("RGB", (grid_img.size[0] + int(label_width), grid_img.size[1]), color=(255, 255, 255))
+    canvas.paste(grid_img, (int(label_width), 0))
+
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+
+    for r in range(n_rows):
+        y0 = pad + r * (cfg.img_size + pad)
+        label = _age_group_label(cfg, r)
+        draw.text((6, y0 + 2), label, fill=(0, 0, 0), font=font)
+
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    out_path = os.path.join(cfg.out_dir, f"samples_epoch_{epoch:04d}_age_rows.png")
+    canvas.save(out_path)
+    G.train()
+
+
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -517,6 +578,8 @@ def main():
 
         if epoch % cfg.sample_every_epochs == 0:
             sample_grid(G, cond_emb, cfg, fixed_z, fixed_y, epoch)
+            if cfg.use_age_groups:
+                sample_agegroup_rows(G, cond_emb, cfg, fixed_z, epoch)
 
         # save checkpoints
         torch.save({
