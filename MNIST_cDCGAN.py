@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 import os
 
 
+N_DIGITS = 10
+
 # ---------------------------------------------------------------------------
 # Pretrained MNIST Classifier
 # ---------------------------------------------------------------------------
@@ -96,7 +98,7 @@ class MNISTActionDataset(torch.utils.data.Dataset):
         self.A = A
         self.cyclic = cyclic
         self.transform = transform
-        self.action_dim = 2 * A + 1
+        self.action_dim = 2 * (N_DIGITS-1) + 1
         self.only_zero_action = False
         self.onehot = lambda x: torch.eye(self.action_dim)[x + A].float()
         self.exclude_pairs = {f'{i}':j for i, j in exclude_pairs.items()}
@@ -121,8 +123,8 @@ class MNISTActionDataset(torch.utils.data.Dataset):
         image = self.images[idx]
         label = self.labels[idx]
         action_list = np.arange(-self.A, self.A + 1)
-        if label in self.exclude_pairs:
-            action_list = action_list[action_list != self.exclude_pairs[label]]
+        if str(label) in self.exclude_pairs:
+            action_list = action_list[action_list != self.exclude_pairs[str(label)]]
         if self.only_zero_action:
             action = 0
             target_label = label
@@ -569,13 +571,15 @@ def save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, sav
 def test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, save_path, n_samples=10):
     cond_encoder.eval()
     G.eval()
+    draw_samples = 300
 
     labels_l = []
     actions_l = []
     target_imgs = []
     source_imgs = []
     action_obs = []
-    for i in range(300):
+    target_labels_l = []
+    for i in range(draw_samples):
         image, label, target_image, target_label, action, action_obs_i = dataset.generate_excluded_pair()
         image = image.to(device)
         target_image = target_image.to(device)
@@ -583,13 +587,15 @@ def test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, 
         action_obs.append(action_obs_i)
         source_imgs.append(image)
         target_imgs.append(target_image)
+        target_labels_l.append(target_label)
+    target_labels = torch.tensor(target_labels_l, dtype=torch.long, device=device)
     source_imgs = torch.stack(source_imgs, dim=0)
     target_imgs = torch.stack(target_imgs, dim=0)
     action_obs = torch.stack(action_obs, dim=0)
     with torch.no_grad():
         cond = cond_encoder(source_imgs, action_obs)
         cond = cond.view(cond.size(0), -1)
-    z = torch.randn(n_samples, latent_dim, device=device)
+    z = torch.randn(draw_samples, latent_dim, device=device)
     fake_imgs = G(z, cond)
     
     classifier.eval()
@@ -608,9 +614,11 @@ def test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, 
     G.train()
     cond_encoder.train()
     
+    return accuracy
     
     
-def save_trial_statistics(G, cond_encoder, train_loader, latent_dim, device, save_path, classifier=None):
+    
+def save_trial_statistics(G, cond_encoder, train_loader, latent_dim, device, save_path, classifier=None, excluded_pairs_accuracy=None):
     """Compute and save Participation Ratio, R^2(target label vs first n PCs), and classifier accuracy on generated images."""
     cond_encoder.eval()
     G.eval()
@@ -681,9 +689,12 @@ def save_trial_statistics(G, cond_encoder, train_loader, latent_dim, device, sav
         "n_l": n_l,
         "classifier_accuracy": classifier_accuracy,
     }
+    if excluded_pairs_accuracy is not None:
+        stats["excluded_pairs_accuracy"] = excluded_pairs_accuracy
     with open(save_path, "wb") as f:
         pickle.dump(stats, f)
     acc_str = f" (classifier acc: {classifier_accuracy:.4f})" if classifier_accuracy is not None else ""
+    excluded_pairs_acc_str = f" (excluded pairs acc: {excluded_pairs_accuracy:.4f})" if excluded_pairs_accuracy is not None else ""
     print(f"Saved trial statistics to {save_path}{acc_str}")
 
 
@@ -713,6 +724,8 @@ def plot_trial_statistics(base_folder):
                 continue
             stats['n_l'] = stats['n_l'][:15]
             stats['r2_per_n'] = stats['r2_per_n'][:15]
+            if "excluded_pairs_accuracy" in stats:
+                stats['excluded_pairs_accuracy'] = stats['excluded_pairs_accuracy']
             data_by_A[A_val].append(stats)
 
     if not data_by_A:
@@ -723,7 +736,7 @@ def plot_trial_statistics(base_folder):
     viridis = plt.colormaps["viridis"]
     colors = [viridis(i / max(len(A_vals_sorted) - 1, 1)) for i in range(len(A_vals_sorted))]
 
-    fig, (ax_line, ax_box) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax_line, ax_box, ax_box2) = plt.subplots(1, 3, figsize=(18, 5))
 
     # Line plot: R^2 vs n, one line per A (mean across seeds), Viridis gradient
     for idx, A_val in enumerate(A_vals_sorted):
@@ -756,6 +769,22 @@ def plot_trial_statistics(base_folder):
         ax_box.text(i + 1, whisker_y + 0.05, f"n={n_samples}", ha='center', va='bottom', fontsize=9)
     ax_box.set_ylabel("Participation Ratio")
     ax_box.set_title("Participation Ratio by A")
+
+    # Boxplot: Excluded Pairs Accuracy per A, Viridis gradient
+    excluded_pairs_acc_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
+    excluded_pairs_acc_values = []
+    for entries in excluded_pairs_acc_by_A:
+        vals_l = []
+        for e in entries:
+            if "excluded_pairs_accuracy" in e:
+                vals_l.append(e["excluded_pairs_accuracy"])
+        excluded_pairs_acc_values.append(vals_l)
+    A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
+    bp = ax_box2.boxplot(excluded_pairs_acc_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
+    ax_box2.set_ylabel("Excluded Pairs Accuracy")
+    ax_box2.set_title("Excluded Pairs Accuracy by A")
 
     plt.tight_layout()
     out_path = os.path.join(base_folder, "trial_statistics_summary.png")
@@ -808,7 +837,7 @@ def _run_single_task(args):
     gpu_id = task_idx % num_gpus
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     exclude_pairs = {
-        '4': 0,
+        '4': 1,
     }
 
     latent_dim = 100
@@ -833,7 +862,7 @@ def _run_single_task(args):
     dataset = MNISTActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-    action_dim = 2 * A + 1
+    action_dim = 2 * (N_DIGITS-1) + 1
     cond_encoder = ConditionEncoder(action_dim=action_dim, cond_dim=cond_dim, hidden_dim=cond_hidden).to(device)
     G = Generator(latent_dim=latent_dim, cond_dim=cond_dim).to(device)
     D = Discriminator(cond_dim=cond_dim).to(device)
@@ -869,8 +898,8 @@ def _run_single_task(args):
     classifier = get_pretrained_mnist_classifier(device)
     dataset.only_zero_action = True
     test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    save_trial_statistics(G, cond_encoder, test_loader, latent_dim, device, f"{out_dir}/trial_statistics.pkl", classifier=classifier)
-    test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, f"{out_dir}/samples_excluded_pairs.png", n_samples=10)
+    excluded_pairs_accuracy = test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, f"{out_dir}/samples_excluded_pairs.png", n_samples=10)
+    save_trial_statistics(G, cond_encoder, test_loader, latent_dim, device, f"{out_dir}/trial_statistics.pkl", classifier=classifier, excluded_pairs_accuracy=excluded_pairs_accuracy)
 
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Done.")
     return out_dir
@@ -883,7 +912,7 @@ def main():
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass  # Already set
-    tasks = list(itertools.product(np.arange(10), np.arange(1)))
+    tasks = list(itertools.product(np.arange(10), np.arange(120)))
     # Assign GPU: task_idx % 8 -> 2 processes per GPU
     task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
 
@@ -895,6 +924,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    # plot_trial_statistics("figures_cDCGAN")
-    # _run_single_task((0, 5, 1))
+    # main()
+    plot_trial_statistics("figures_cDCGAN")
+    # _run_single_task((0, 0, 0))
