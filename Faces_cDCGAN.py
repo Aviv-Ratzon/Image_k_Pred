@@ -19,16 +19,16 @@ from tqdm import tqdm
 # ----------------------------
 @dataclass
 class TrainConfig:
-    data_root: str = "./data/faces_aligned"   # folder with images
+    data_root: str = "./data/faces"   # folder with images
     out_dir: str = "./runs/cdcgan_age"
-    img_size: int = 128                # DCGAN typical: 64
+    img_size: int = 64                # DCGAN typical: 64
     batch_size: int = 128
     num_workers: int = 8
-    epochs: int = 500
+    epochs: int = 100
     lr: float = 2e-4
     betas: Tuple[float, float] = (0.5, 0.999)
 
-    z_dim: int = 512
+    z_dim: int = 256
     g_channels: int = 64
     d_channels: int = 64
 
@@ -45,7 +45,7 @@ class TrainConfig:
     # training tricks
     amp: bool = True
     seed: int = 42
-    sample_every_epochs: int = 50
+    sample_every_epochs: int = 10
     fixed_n: int = 64                # number of fixed samples
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -102,7 +102,7 @@ def ensure_face_data_downloaded(
     # Export
     print(f"[data] Exporting {len(ds)} images to {data_root} ...")
     for ex in tqdm(ds, total=len(ds)):
-        img = ex["image"]  # PIL image
+        img = ex["jpg.chip.jpg"]  # PIL image
         age = int(ex["age"]) if ex.get("age") is not None else 0
 
         # these fields may exist depending on dataset; safe defaults
@@ -113,7 +113,8 @@ def ensure_face_data_downloaded(
         # Normalize to UTKFace-like filename
         # Keep the critical part: filename starts with "{age}_"
         suffix = str(img_id) if img_id is not None else f"hf_{abs(hash(str(ex))) % (10**14)}"
-        fn = f"{age}_{gender}_{ethnicity}_{suffix}.jpg"
+        # fn = f"{age}_{gender}_{ethnicity}_{suffix}.jpg"
+        fn = f"{ex['__key__'].split('/')[-1]}.jpg"
         out_path = os.path.join(data_root, fn)
 
         # Save as jpeg for consistency (convert RGBA/P to RGB; JPEG does not support alpha)
@@ -379,7 +380,7 @@ def main():
 
     ensure_face_data_downloaded(
         data_root=cfg.data_root,
-        dataset_name="ljnlonoljpiljm/utkface",
+        dataset_name="py97/UTKFace-Cropped",
         split="train",
         limit=None,   # set e.g. 2000 for a fast smoke test
     )

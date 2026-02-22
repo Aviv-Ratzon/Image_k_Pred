@@ -209,7 +209,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", type=str, default="data/faces", help="Input folder (recursive).")
     ap.add_argument("--out_dir", type=str, default="data/faces_aligned", help="Output folder.")
-    ap.add_argument("--image_size", type=int, default=128, help="Output size (64 recommended).")
+    ap.add_argument("--image_size", type=int, default=64, help="Output size (64 recommended).")
     ap.add_argument("--margin", type=int, default=16, help="MTCNN margin (pixels).")
     ap.add_argument("--batch_size", type=int, default=128, help="MTCNN batch size per GPU process.")
     ap.add_argument("--gpus", type=str, default="all", help="Comma list, e.g. 0,1,2 or 'all'.")
