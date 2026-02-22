@@ -912,7 +912,7 @@ def main():
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass  # Already set
-    tasks = list(itertools.product(np.arange(10), np.arange(120)))
+    tasks = list(itertools.product(np.arange(10), np.arange(5,120)))
     # Assign GPU: task_idx % 8 -> 2 processes per GPU
     task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
 
