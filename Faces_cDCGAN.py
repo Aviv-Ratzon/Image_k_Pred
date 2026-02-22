@@ -577,9 +577,10 @@ def main():
             pbar.set_postfix(lossD=float(lossD.detach().cpu()), lossG=float(lossG.detach().cpu()))
 
         if epoch % cfg.sample_every_epochs == 0:
-            sample_grid(G, cond_emb, cfg, fixed_z, fixed_y, epoch)
             if cfg.use_age_groups:
                 sample_agegroup_rows(G, cond_emb, cfg, fixed_z, epoch)
+            else:
+                sample_grid(G, cond_emb, cfg, fixed_z, fixed_y, epoch)
 
         # save checkpoints
         torch.save({
