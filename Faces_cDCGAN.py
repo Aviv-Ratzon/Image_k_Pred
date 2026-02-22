@@ -212,6 +212,19 @@ def weights_init_dcgan(m):
     elif classname.find("BatchNorm") != -1:
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0.0)
+    elif classname.find("Linear") != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+        if getattr(m, "bias", None) is not None and m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.0)
+
+
+def _next_pow2_ge(n: int, min_value: int = 4) -> int:
+    if n < min_value:
+        return min_value
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
 
 
 class CondEmbedding(nn.Module):
@@ -243,38 +256,53 @@ class CondEmbedding(nn.Module):
 class Generator(nn.Module):
     """
     DCGAN generator with conditional injection by concatenating z and cond embedding.
-    Output: 3x64x64 in [-1,1] via Tanh.
+    Supports arbitrary square output sizes by:
+    - generating a feature map at the next power-of-two resolution (>= out_size)
+    - resizing to (out_size, out_size)
+    - projecting to RGB with a conv + tanh
     """
     def __init__(self, z_dim: int, cond_dim: int, base_ch: int = 64, out_size: int = 64):
         super().__init__()
-        # assert out_size == 64, "This reference implementation is fixed to 64x64 for simplicity."
+        if out_size < 4:
+            raise ValueError(f"out_size must be >= 4, got {out_size}")
+
+        self.out_size = int(out_size)
+        self.base_ch = int(base_ch)
+        self.target_size = _next_pow2_ge(self.out_size, min_value=4)
+
         in_dim = z_dim + cond_dim
-        self.net = nn.Sequential(
-            # in: (B, in_dim, 1, 1)
-            nn.ConvTranspose2d(in_dim, base_ch * 8, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(base_ch * 8),
-            nn.ReLU(True),
 
-            nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(base_ch * 4),
+        layers: List[nn.Module] = []
+        # 1x1 -> 4x4
+        ch = base_ch * 8
+        layers += [
+            nn.ConvTranspose2d(in_dim, ch, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ch),
             nn.ReLU(True),
+        ]
 
-            nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(base_ch * 2),
-            nn.ReLU(True),
+        # 4 -> target_size (powers of two)
+        steps = int(math.log2(self.target_size // 4)) if self.target_size > 4 else 0
+        for _ in range(steps):
+            next_ch = max(base_ch, ch // 2)
+            layers += [
+                nn.ConvTranspose2d(ch, next_ch, 4, 2, 1, bias=False),
+                nn.BatchNorm2d(next_ch),
+                nn.ReLU(True),
+            ]
+            ch = next_ch
 
-            nn.ConvTranspose2d(base_ch * 2, base_ch, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(base_ch),
-            nn.ReLU(True),
-
-            nn.ConvTranspose2d(base_ch, 3, 4, 2, 1, bias=False),
-            nn.Tanh(),
-        )
+        self.net = nn.Sequential(*layers)
+        self.to_rgb = nn.Conv2d(ch, 3, kernel_size=3, stride=1, padding=1, bias=True)
 
     def forward(self, z, c):
         # z: [B,z_dim], c: [B,cond_dim]
         x = torch.cat([z, c], dim=1).unsqueeze(-1).unsqueeze(-1)
-        return self.net(x)
+        x = self.net(x)  # [B, C, target_size, target_size]
+        if self.target_size != self.out_size:
+            x = F.interpolate(x, size=(self.out_size, self.out_size), mode="bilinear", align_corners=False)
+        x = self.to_rgb(x)
+        return torch.tanh(x)
 
 
 class ProjectionDiscriminator(nn.Module):
@@ -286,45 +314,52 @@ class ProjectionDiscriminator(nn.Module):
     Optional: ACGAN-style aux classifier head.
     """
     def __init__(self, cond_dim: int, base_ch: int = 64, use_aux_classifier: bool = False,
-                 num_age_groups: int = 8, use_age_groups: bool = True):
+                 num_age_groups: int = 8, use_age_groups: bool = True, img_size: int = 64):
         super().__init__()
         self.use_aux_classifier = use_aux_classifier
         self.use_age_groups = use_age_groups
         self.num_age_groups = num_age_groups
 
-        # 64x64 -> 4x4
-        self.feat = nn.Sequential(
-            nn.Conv2d(3, base_ch, 4, 2, 1, bias=False),     # 32
-            nn.LeakyReLU(0.2, inplace=True),
+        if img_size < 4:
+            raise ValueError(f"img_size must be >= 4, got {img_size}")
 
-            nn.Conv2d(base_ch, base_ch * 2, 4, 2, 1, bias=False),  # 16
-            nn.BatchNorm2d(base_ch * 2),
+        # Size-agnostic discriminator:
+        # downsample a few times with stride-2 convs, then global pool to 1x1.
+        layers: List[nn.Module] = []
+        ch = base_ch
+        layers += [
+            nn.Conv2d(3, ch, 4, 2, 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
+        ]
 
-            nn.Conv2d(base_ch * 2, base_ch * 4, 4, 2, 1, bias=False),  # 8
-            nn.BatchNorm2d(base_ch * 4),
-            nn.LeakyReLU(0.2, inplace=True),
+        s = int(img_size) // 2  # after first stride-2 conv
+        max_mult = 8
+        while s > 4:
+            next_ch = min(base_ch * max_mult, ch * 2)
+            layers += [
+                nn.Conv2d(ch, next_ch, 4, 2, 1, bias=False),
+                nn.BatchNorm2d(next_ch),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+            ch = next_ch
+            s = s // 2
 
-            nn.Conv2d(base_ch * 4, base_ch * 8, 4, 2, 1, bias=False),  # 4
-            nn.BatchNorm2d(base_ch * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.final_conv = nn.Conv2d(base_ch * 8, base_ch * 8, 4, 1, 0, bias=False)  # 1x1
-        self.out = nn.Linear(base_ch * 8, 1)
+        self.feat = nn.Sequential(*layers)
+        self.out = nn.Linear(ch, 1)
 
-        # projection embedding maps condition -> same dimension as features
-        self.proj = nn.Linear(cond_dim, base_ch * 8, bias=False)
+        # projection embedding maps condition -> same dimension as pooled features
+        self.proj = nn.Linear(cond_dim, ch, bias=False)
 
         # optional aux head (better if condition is discrete)
         if self.use_aux_classifier:
             if not self.use_age_groups:
                 raise ValueError("Aux classifier is intended for discrete age groups.")
-            self.aux = nn.Linear(base_ch * 8, num_age_groups)
+            self.aux = nn.Linear(ch, num_age_groups)
 
     def forward(self, x, c):
         h = self.feat(x)
-        h = self.final_conv(h).squeeze(-1).squeeze(-1)  # [B, feat_dim]
-        base_logit = self.out(h).squeeze(1)             # [B]
+        h = F.adaptive_avg_pool2d(h, output_size=1).flatten(1)  # [B, feat_dim]
+        base_logit = self.out(h).squeeze(1)                     # [B]
 
         # projection term
         pc = self.proj(c)                                # [B, feat_dim]
@@ -405,6 +440,7 @@ def main():
         use_aux_classifier=cfg.use_aux_classifier,
         num_age_groups=cfg.num_age_groups,
         use_age_groups=cfg.use_age_groups,
+        img_size=cfg.img_size,
     ).to(device)
 
     G.apply(weights_init_dcgan)
