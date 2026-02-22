@@ -92,13 +92,14 @@ def get_pretrained_mnist_classifier(device, checkpoint_path="checkpoints/mnist_c
 class MNISTActionDataset(torch.utils.data.Dataset):
     """Dataset for MNIST with action-based transformations."""
 
-    def __init__(self, A=2, cyclic=False, transform=None):
+    def __init__(self, A=2, cyclic=False, transform=None, exclude_pairs={}):
         self.A = A
         self.cyclic = cyclic
         self.transform = transform
         self.action_dim = 2 * A + 1
         self.only_zero_action = False
         self.onehot = lambda x: torch.eye(self.action_dim)[x + A].float()
+        self.exclude_pairs = {f'{i}':j for i, j in exclude_pairs.items()}
 
         self.dataset = torchvision.datasets.MNIST(
             root="./data", train=True, download=True, transform=transform
@@ -119,16 +120,18 @@ class MNISTActionDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         image = self.images[idx]
         label = self.labels[idx]
+        action_list = np.arange(-self.A, self.A + 1)
+        if label in self.exclude_pairs:
+            action_list = action_list[action_list != self.exclude_pairs[label]]
         if self.only_zero_action:
             action = 0
             target_label = label
         elif self.cyclic:
-            action = random.randint(-self.A, self.A)
+            action = random.choice(action_list)
             target_label = (label + action) % 10
         else:
-            action = random.randint(
-                max(-label, -self.A), min(9 - label, self.A)
-            )
+            action_list = action_list[(action_list >= max(-label, -self.A)) & (action_list <= min(9 - label, self.A))]
+            action = random.choice(action_list)
             target_label = label + action
         action_obs = self.onehot(action)
         n = self._class_size[target_label]
@@ -136,6 +139,17 @@ class MNISTActionDataset(torch.utils.data.Dataset):
         target_image = self.images[target_image_idx]
         return image, label, target_image, target_label, action, action_obs
 
+    def generate_excluded_pair(self):
+        label = random.choice(list(self.exclude_pairs.keys()))
+        action = self.exclude_pairs[label]
+        label = int(label)
+        action_obs = self.onehot(action)
+
+        image = self.images[np.random.choice(self.data_idx_by_class[label])]
+        target_label = label + action
+        target_image_idx = np.random.choice(self.data_idx_by_class[target_label])
+        target_image = self.images[target_image_idx]
+        return image, label, target_image, target_label, action, action_obs
 
 # ---------------------------------------------------------------------------
 # ConditionEncoder: (image, action_obs) -> cond_embedding
@@ -552,6 +566,50 @@ def save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, sav
     G.train()
     cond_encoder.train()
 
+def test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, save_path, n_samples=10):
+    cond_encoder.eval()
+    G.eval()
+
+    labels_l = []
+    actions_l = []
+    target_imgs = []
+    source_imgs = []
+    action_obs = []
+    for i in range(300):
+        image, label, target_image, target_label, action, action_obs_i = dataset.generate_excluded_pair()
+        image = image.to(device)
+        target_image = target_image.to(device)
+        action_obs_i = action_obs_i.to(device)
+        action_obs.append(action_obs_i)
+        source_imgs.append(image)
+        target_imgs.append(target_image)
+    source_imgs = torch.stack(source_imgs, dim=0)
+    target_imgs = torch.stack(target_imgs, dim=0)
+    action_obs = torch.stack(action_obs, dim=0)
+    with torch.no_grad():
+        cond = cond_encoder(source_imgs, action_obs)
+        cond = cond.view(cond.size(0), -1)
+    z = torch.randn(n_samples, latent_dim, device=device)
+    fake_imgs = G(z, cond)
+    
+    classifier.eval()
+    pred = classifier(fake_imgs).argmax(dim=1)
+    correct = (pred == target_labels).sum().item()
+    total = target_labels.size(0)
+    accuracy = correct / total
+
+    rows = []
+    for i in range(min(10, n_samples)):
+        row = torch.cat([source_imgs[i:i+1], target_imgs[i:i+1], fake_imgs[i:i+1]], dim=0)
+        rows.append(row)
+    grid = torch.cat(rows, dim=0)
+    grid = make_grid(grid, nrow=3, normalize=True, padding=2)
+    save_image(grid, save_path)
+    G.train()
+    cond_encoder.train()
+    
+    
+    
 def save_trial_statistics(G, cond_encoder, train_loader, latent_dim, device, save_path, classifier=None):
     """Compute and save Participation Ratio, R^2(target label vs first n PCs), and classifier accuracy on generated images."""
     cond_encoder.eval()
@@ -749,6 +807,9 @@ def _run_single_task(args):
     num_gpus = 8
     gpu_id = task_idx % num_gpus
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+    exclude_pairs = {
+        '4': 0,
+    }
 
     latent_dim = 100
     batch_size = 128
@@ -769,7 +830,7 @@ def _run_single_task(args):
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)),
     ])
-    dataset = MNISTActionDataset(A=A, cyclic=False, transform=transform)
+    dataset = MNISTActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     action_dim = 2 * A + 1
@@ -799,18 +860,17 @@ def _run_single_task(args):
 
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Saving visualizations...")
     plot_loss(loss_G_list, loss_D_list, f"{out_dir}/loss.png")
-    save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
-                      f"{out_dir}/samples_grid.png", n_samples=30)
+    save_samples_grid(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples_grid.png", n_samples=30)
     plot_comparison(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/comparison.png")
     plot_interpolation(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/interpolation.png")
-    save_samples_grid(G, cond_encoder, train_loader, latent_dim, device,
-                      f"{out_dir}/samples/final.png", n_samples=20)
+    save_samples_grid(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples/final.png", n_samples=20)
     plot_cond_pca(cond_encoder, train_loader, device, f"{out_dir}/cond_pca.png")
     save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples_grid_pca.png", n_samples=40)
     classifier = get_pretrained_mnist_classifier(device)
     dataset.only_zero_action = True
     test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     save_trial_statistics(G, cond_encoder, test_loader, latent_dim, device, f"{out_dir}/trial_statistics.pkl", classifier=classifier)
+    test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, f"{out_dir}/samples_excluded_pairs.png", n_samples=10)
 
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Done.")
     return out_dir
@@ -823,7 +883,7 @@ def main():
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass  # Already set
-    tasks = list(itertools.product(np.arange(10), np.arange(31,120)))
+    tasks = list(itertools.product(np.arange(10), np.arange(1)))
     # Assign GPU: task_idx % 8 -> 2 processes per GPU
     task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
 
@@ -835,6 +895,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
-    plot_trial_statistics("figures_cDCGAN")
+    main()
+    # plot_trial_statistics("figures_cDCGAN")
     # _run_single_task((0, 5, 1))

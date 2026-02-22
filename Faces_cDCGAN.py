@@ -21,7 +21,7 @@ from tqdm import tqdm
 class TrainConfig:
     data_root: str = "./data/faces"   # folder with images
     out_dir: str = "./runs/cdcgan_age"
-    img_size: int = 64                # DCGAN typical: 64
+    img_size: int = 128                # DCGAN typical: 64
     batch_size: int = 128
     num_workers: int = 8
     epochs: int = 100
@@ -34,7 +34,7 @@ class TrainConfig:
 
     # conditioning
     use_age_groups: bool = True       # True: discrete groups; False: continuous age
-    num_age_groups: int = 8           # used if use_age_groups=True
+    num_age_groups: int = 10           # used if use_age_groups=True
     # If continuous age: we normalize age to [0,1] by age/max_age_for_norm
     max_age_for_norm: float = 100.0
 
@@ -46,7 +46,7 @@ class TrainConfig:
     amp: bool = True
     seed: int = 42
     sample_every_epochs: int = 10
-    fixed_n: int = 64                # number of fixed samples
+    fixed_n: int = 80                # number of fixed samples
 
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -103,6 +103,8 @@ def ensure_face_data_downloaded(
     print(f"[data] Exporting {len(ds)} images to {data_root} ...")
     for ex in tqdm(ds, total=len(ds)):
         img = ex["jpg.chip.jpg"]  # PIL image
+        if img is None:
+            continue
         age = int(ex["age"]) if ex.get("age") is not None else 0
 
         # these fields may exist depending on dataset; safe defaults
