@@ -27,7 +27,8 @@ from typing import Optional, Tuple
 from PIL import Image
 
 
-N_DIGITS = 26  # EMNIST letters: 26 classes
+N_DIGITS = 10  # EMNIST letters: 26 classes
+USE_GPU = True
 
 # Expected CSV format (common Kaggle "A_Z Handwritten Data"):
 # - One row per sample
@@ -58,7 +59,7 @@ class EMNISTLettersClassifier(nn.Module):
             nn.Linear(64 * 7 * 7, 128),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(128, N_DIGITS),
+            nn.Linear(128, 62),
         )
 
     def forward(self, x):
@@ -75,16 +76,21 @@ def get_pretrained_emnist_letters_classifier(
     if d:
         os.makedirs(d, exist_ok=True)
     classifier = EMNISTLettersClassifier().to(device)
-    if os.path.isfile(checkpoint_path):
-        classifier.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        classifier.eval()
-        print(f"Loaded pretrained classifier from {checkpoint_path}")
-        return classifier
+    try:
+        if os.path.isfile(checkpoint_path):
+            classifier.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            classifier.eval()
+            print(f"Loaded pretrained classifier from {checkpoint_path}")
+            return classifier
+    except:
+        print(f"Failed to load pretrained classifier from {checkpoint_path}")
     # Train classifier
     print(f"Training letters classifier on A_Z CSV (saving to {checkpoint_path})...")
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
     train_ds = AZHandwrittenLettersDataset(csv_path=AZ_CSV_PATH, cache_dir=AZ_CACHE_DIR, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
+    test_ds = torchvision.datasets.EMNIST(root="./data", split="byclass", train=False, download=True, transform=transform)
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=True, num_workers=0)
     opt = optim.Adam(classifier.parameters(), lr=1e-3)
     classifier.train()
     for epoch in range(10):
@@ -95,10 +101,19 @@ def get_pretrained_emnist_letters_classifier(
             loss = nn.functional.cross_entropy(logits, batch_y)
             loss.backward()
             opt.step()
+        accuracy = 0.0
+        for batch_x, batch_y in test_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            logits = classifier(batch_x)
+            accuracy += (logits.argmax(dim=1) == batch_y).sum().item() / batch_y.size(0)
+        accuracy /= len(test_loader)
+        print(f"Epoch {epoch+1}: Accuracy = {accuracy:.4f}")
     classifier.eval()
     torch.save(classifier.state_dict(), checkpoint_path)
     print(f"Saved classifier to {checkpoint_path}")
     return classifier
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +222,10 @@ class AZHandwrittenActionDataset(torch.utils.data.Dataset):
         self.action_dim = 2 * (N_DIGITS-1) + 1
         self.only_zero_action = False
         self.onehot = lambda x: torch.eye(self.action_dim)[x + A].float()
-        self.exclude_pairs = {f'{i}':j for i, j in exclude_pairs.items()}
+        if exclude_pairs is not None:
+            self.exclude_pairs = {f'{i}':j for i, j in exclude_pairs.items()}
+        else:
+            self.exclude_pairs = {}
 
         self.dataset = AZHandwrittenLettersDataset(csv_path=AZ_CSV_PATH, cache_dir=AZ_CACHE_DIR, transform=transform)
         self.data_idx_by_class = {i: [] for i in range(N_DIGITS)}
@@ -219,6 +237,17 @@ class AZHandwrittenActionDataset(torch.utils.data.Dataset):
             self.labels.append(label)
         self._class_size = [len(self.data_idx_by_class[c]) for c in range(N_DIGITS)]
         print(f"AZHandwrittenActionDataset: A={A}, cyclic={cyclic}, samples={len(self.images)}")
+
+        n_samples_plot = 3
+        fig, axs = plt.subplots(len(np.unique(self.labels)), n_samples_plot, figsize=(3*n_samples_plot, 3*len(np.unique(self.labels))))
+        for i, label in enumerate(np.unique(self.labels)):
+            for j in range(n_samples_plot):
+                axs[i, j].imshow(self.images[np.random.choice(self.data_idx_by_class[label])].squeeze(), cmap="gray")
+                axs[i, j].axis("off")
+            axs[i, 0].set_ylabel(f"Label: {label}")
+        plt.tight_layout()
+        plt.savefig(f"figures_EMNIST_cDCGAN/A_{A}/data_samples.png")
+        plt.close()
 
     def __len__(self):
         return len(self.images)
@@ -830,7 +859,7 @@ def plot_trial_statistics(base_folder):
             print(stats["classifier_accuracy"])
             # Keep only runs above a simple "better than chance" threshold.
             # For MNIST this was 0.3 (i.e., 3 / 10). For EMNIST letters it's 3 / 26 ≈ 0.115.
-            min_acc = 3.0 / N_DIGITS
+            min_acc = 0 # 3.0 / N_DIGITS
             if stats["classifier_accuracy"] < min_acc:
                 continue
             stats['n_l'] = stats['n_l'][:15]
@@ -946,9 +975,9 @@ def _run_single_task(args):
     task_idx, A, seed = args
     num_gpus = 8
     gpu_id = task_idx % num_gpus
-    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() and USE_GPU else "cpu")
     # Optional OOD generalization probe ("excluded pair"). For A=0, no non-zero action is representable.
-    exclude_pairs = {"0": 1} if int(A) >= 1 else {}
+    exclude_pairs = None # {"0": 1} if int(A) >= 1 else {}
 
     latent_dim = 100
     batch_size = 128
@@ -968,6 +997,8 @@ def _run_single_task(args):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)),
+        transforms.Lambda(lambda x: x.transpose(1, 2)),  # rotate
+        # transforms.Lambda(lambda x: x.flip(2)),     
     ])
     dataset = AZHandwrittenActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
@@ -1029,15 +1060,17 @@ def _run_single_task(args):
 
 
 def main():
-    num_processes = 16
+    num_processes = 8
     num_gpus = 8
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass  # Already set
-    tasks = list(itertools.product(np.arange(N_DIGITS), np.arange(30)))
+    tasks = list(itertools.product(np.arange(2), np.arange(10)))
     # Assign GPU: task_idx % 8 -> 2 processes per GPU
     task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
+    # shuffle task_args
+    random.shuffle(task_args)
 
     print(f"Running {len(tasks)} tasks with {num_processes} processes across {num_gpus} GPUs")
     with mp.Pool(num_processes) as pool:
