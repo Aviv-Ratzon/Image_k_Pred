@@ -1,6 +1,6 @@
 """
-cDCGAN (conditional Deep Convolutional GAN) for EMNIST (letters only)
-Conditioned on (source image, action) from EMNISTActionDataset.
+cDCGAN (conditional Deep Convolutional GAN) for A_Z Handwritten Data (letters only)
+Conditioned on (source image, action) from AZHandwrittenActionDataset.
 Uses a ConditionEncoder (CNN + FCN) to encode the conditioning inputs.
 """
 
@@ -21,15 +21,26 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
+from typing import Optional, Tuple
+
+from PIL import Image
 
 
 N_DIGITS = 26  # EMNIST letters: 26 classes
 
+# Expected CSV format (common Kaggle "A_Z Handwritten Data"):
+# - One row per sample
+# - First column: label in [0..25] (A..Z)
+# - Next 784 columns: pixel intensities in [0..255] for a 28x28 image (row-major)
+AZ_CSV_PATH = os.environ.get("AZ_CSV_PATH", "./data/A_Z Handwritten Data.csv")
+AZ_CACHE_DIR = os.environ.get("AZ_CACHE_DIR", "./data/az_cache")
+
 # ---------------------------------------------------------------------------
-# Pretrained EMNIST Letters Classifier
+# Pretrained Letters Classifier (trained on A_Z CSV)
 # ---------------------------------------------------------------------------
 class EMNISTLettersClassifier(nn.Module):
-    """Simple CNN classifier for 28x28 grayscale EMNIST letters. Expects input normalized to [-1, 1]."""
+    """Simple CNN classifier for 28x28 grayscale letters. Expects input normalized to [-1, 1]."""
 
     def __init__(self):
         super().__init__()
@@ -59,7 +70,7 @@ class EMNISTLettersClassifier(nn.Module):
 def get_pretrained_emnist_letters_classifier(
     device, checkpoint_path="checkpoints/emnist_letters_classifier_cdcgan.pt"
 ):
-    """Load pretrained EMNIST-letters classifier, training it first if checkpoint does not exist."""
+    """Load pretrained letters classifier, training it first if checkpoint does not exist."""
     d = os.path.dirname(checkpoint_path)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -70,18 +81,15 @@ def get_pretrained_emnist_letters_classifier(
         print(f"Loaded pretrained classifier from {checkpoint_path}")
         return classifier
     # Train classifier
-    print(f"Training EMNIST letters classifier (saving to {checkpoint_path})...")
+    print(f"Training letters classifier on A_Z CSV (saving to {checkpoint_path})...")
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-    train_ds = torchvision.datasets.EMNIST(
-        root="./data", split="letters", train=True, download=True, transform=transform
-    )
+    train_ds = AZHandwrittenLettersDataset(csv_path=AZ_CSV_PATH, cache_dir=AZ_CACHE_DIR, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
     opt = optim.Adam(classifier.parameters(), lr=1e-3)
     classifier.train()
     for epoch in range(10):
         for batch_x, batch_y in train_loader:
-            # EMNIST letters labels are 1..26; remap to 0..25
-            batch_x, batch_y = batch_x.to(device), (batch_y.to(device) - 1)
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             opt.zero_grad()
             logits = classifier(batch_x)
             loss = nn.functional.cross_entropy(logits, batch_y)
@@ -94,10 +102,103 @@ def get_pretrained_emnist_letters_classifier(
 
 
 # ---------------------------------------------------------------------------
-# EMNISTActionDataset (letters only)
+# A_Z Handwritten (CSV) datasets
 # ---------------------------------------------------------------------------
-class EMNISTActionDataset(torch.utils.data.Dataset):
-    """Dataset for EMNIST letters (26 classes) with action-based transformations."""
+def _az_cache_paths(cache_dir: str) -> Tuple[Path, Path]:
+    cache_root = Path(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root / "labels.npy", cache_root / "pixels.npy"
+
+
+def _has_csv_header(first_line: str) -> bool:
+    parts = first_line.strip().split(",")
+    try:
+        int(parts[0])
+        return False
+    except Exception:
+        return True
+
+
+def prepare_az_cache(csv_path: str, cache_dir: str) -> Tuple[str, str]:
+    """
+    Prepare `.npy` cache files from the A_Z CSV for faster future loads.
+
+    Creates:
+    - {cache_dir}/labels.npy  shape [N]   uint8
+    - {cache_dir}/pixels.npy  shape [N,784] uint8
+    """
+    labels_path, pixels_path = _az_cache_paths(cache_dir)
+    if labels_path.is_file() and pixels_path.is_file():
+        return str(labels_path), str(pixels_path)
+
+    csv_path_p = Path(csv_path)
+    if not csv_path_p.is_file():
+        raise FileNotFoundError(
+            f"Could not find A_Z CSV at {csv_path!r}. "
+            f"Place it there, or set env var AZ_CSV_PATH to the correct path."
+        )
+
+    with csv_path_p.open("r", encoding="utf-8", errors="ignore") as f:
+        first_line = f.readline()
+    skiprows = 1 if _has_csv_header(first_line) else 0
+
+    data = np.loadtxt(str(csv_path_p), delimiter=",", skiprows=skiprows, dtype=np.uint16)
+    if data.ndim != 2 or data.shape[1] < 2:
+        raise ValueError(f"Unexpected CSV shape {getattr(data, 'shape', None)} for file {csv_path!r}")
+
+    labels = data[:, 0].astype(np.int64)
+    pixels = data[:, 1:].astype(np.uint16)
+    if pixels.shape[1] != 28 * 28:
+        raise ValueError(
+            f"Expected 784 pixel columns after label, got {pixels.shape[1]} columns in {csv_path!r}"
+        )
+    if labels.min() < 0 or labels.max() >= N_DIGITS:
+        raise ValueError(f"Labels must be in [0..{N_DIGITS-1}] but got min={labels.min()} max={labels.max()}")
+    if pixels.min() < 0 or pixels.max() > 255:
+        raise ValueError(f"Pixels must be in [0..255] but got min={pixels.min()} max={pixels.max()}")
+
+    labels_u8 = labels.astype(np.uint8, copy=False)
+    pixels_u8 = pixels.astype(np.uint8, copy=False)
+
+    # Atomic-ish writes (avoid half-written files if interrupted)
+    labels_tmp = labels_path.with_suffix(".npy.tmp")
+    pixels_tmp = pixels_path.with_suffix(".npy.tmp")
+    np.save(str(labels_tmp), labels_u8)
+    np.save(str(pixels_tmp), pixels_u8)
+    os.replace(str(labels_tmp), str(labels_path))
+    os.replace(str(pixels_tmp), str(pixels_path))
+
+    return str(labels_path), str(pixels_path)
+
+
+class AZHandwrittenLettersDataset(torch.utils.data.Dataset):
+    """(image, label) dataset backed by `A_Z Handwritten Data.csv`."""
+
+    def __init__(self, csv_path: str = AZ_CSV_PATH, cache_dir: str = AZ_CACHE_DIR, transform=None):
+        self.csv_path = csv_path
+        self.cache_dir = cache_dir
+        self.transform = transform
+
+        labels_path, pixels_path = prepare_az_cache(self.csv_path, self.cache_dir)
+        self.labels = np.load(labels_path, mmap_mode="r")
+        self.pixels = np.load(pixels_path, mmap_mode="r")
+        if self.pixels.shape[0] != self.labels.shape[0]:
+            raise ValueError("Cache mismatch: labels and pixels have different number of rows")
+
+    def __len__(self):
+        return int(self.labels.shape[0])
+
+    def __getitem__(self, idx):
+        label = int(self.labels[idx])
+        img_u8 = self.pixels[idx].reshape(28, 28).astype(np.uint8, copy=False)
+        img = Image.fromarray(img_u8, mode="L")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+class AZHandwrittenActionDataset(torch.utils.data.Dataset):
+    """Action dataset for A_Z letters: returns (source, label, target, target_label, action, action_onehot)."""
 
     def __init__(self, A=2, cyclic=False, transform=None, exclude_pairs={}):
         self.A = A
@@ -108,20 +209,16 @@ class EMNISTActionDataset(torch.utils.data.Dataset):
         self.onehot = lambda x: torch.eye(self.action_dim)[x + A].float()
         self.exclude_pairs = {f'{i}':j for i, j in exclude_pairs.items()}
 
-        self.dataset = torchvision.datasets.EMNIST(
-            root="./data", split="letters", train=True, download=True, transform=transform
-        )
+        self.dataset = AZHandwrittenLettersDataset(csv_path=AZ_CSV_PATH, cache_dir=AZ_CACHE_DIR, transform=transform)
         self.data_idx_by_class = {i: [] for i in range(N_DIGITS)}
         self.images = []
         self.labels = []
         for idx, (image, label) in enumerate(self.dataset):
-            # EMNIST letters labels are 1..26; remap to 0..25
-            label = int(label) - 1
             self.data_idx_by_class[label].append(idx)
             self.images.append(image)
             self.labels.append(label)
         self._class_size = [len(self.data_idx_by_class[c]) for c in range(N_DIGITS)]
-        print(f"EMNISTActionDataset(letters): A={A}, cyclic={cyclic}, samples={len(self.images)}")
+        print(f"AZHandwrittenActionDataset: A={A}, cyclic={cyclic}, samples={len(self.images)}")
 
     def __len__(self):
         return len(self.images)
@@ -872,7 +969,7 @@ def _run_single_task(args):
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)),
     ])
-    dataset = EMNISTActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
+    dataset = AZHandwrittenActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     action_dim = 2 * (N_DIGITS-1) + 1
@@ -951,5 +1048,5 @@ def main():
 
 if __name__ == "__main__":
     # main()
-    plot_trial_statistics("figures_EMNIST_cDCGAN")
-    # _run_single_task((0, 0, 0))
+    # plot_trial_statistics("figures_EMNIST_cDCGAN")
+    _run_single_task((0, 0, 0))
