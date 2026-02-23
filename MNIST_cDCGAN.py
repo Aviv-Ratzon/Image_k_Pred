@@ -72,6 +72,8 @@ def get_pretrained_mnist_classifier(device, checkpoint_path="checkpoints/mnist_c
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
     train_ds = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
+    test_ds = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=True, num_workers=0)
     opt = optim.Adam(classifier.parameters(), lr=1e-3)
     classifier.train()
     for epoch in range(10):
@@ -82,6 +84,13 @@ def get_pretrained_mnist_classifier(device, checkpoint_path="checkpoints/mnist_c
             loss = nn.functional.cross_entropy(logits, batch_y)
             loss.backward()
             opt.step()
+        accuracy = 0.0
+        for batch_x, batch_y in test_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            logits = classifier(batch_x)
+            accuracy += (logits.argmax(dim=1) == batch_y).sum().item() / batch_y.size(0)
+        accuracy /= len(test_loader)
+        print(f"Epoch {epoch+1}: Accuracy = {accuracy:.4f}")
     classifier.eval()
     torch.save(classifier.state_dict(), checkpoint_path)
     print(f"Saved classifier to {checkpoint_path}")
@@ -110,6 +119,8 @@ class MNISTActionDataset(torch.utils.data.Dataset):
         self.images = []
         self.labels = []
         for idx, (image, label) in enumerate(self.dataset):
+            if label >= N_DIGITS:
+                continue
             self.data_idx_by_class[label].append(idx)
             self.images.append(image)
             self.labels.append(label)
@@ -842,7 +853,7 @@ def _run_single_task(args):
 
     latent_dim = 100
     batch_size = 128
-    epochs = 30
+    epochs = 1
     lr = 2e-4
     cond_dim = 128
     cond_hidden = 256
@@ -898,7 +909,10 @@ def _run_single_task(args):
     classifier = get_pretrained_mnist_classifier(device)
     dataset.only_zero_action = True
     test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    excluded_pairs_accuracy = test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, f"{out_dir}/samples_excluded_pairs.png", n_samples=10)
+    if exclude_pairs is not None:
+        excluded_pairs_accuracy = test_model_excluded_pairs(G, cond_encoder, dataset, classifier, latent_dim, device, f"{out_dir}/samples_excluded_pairs.png", n_samples=10)
+    else:
+        excluded_pairs_accuracy = None
     save_trial_statistics(G, cond_encoder, test_loader, latent_dim, device, f"{out_dir}/trial_statistics.pkl", classifier=classifier, excluded_pairs_accuracy=excluded_pairs_accuracy)
 
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Done.")
@@ -925,5 +939,5 @@ def main():
 
 if __name__ == "__main__":
     # main()
-    plot_trial_statistics("figures_cDCGAN")
+    # plot_trial_statistics("figures_cDCGAN")
     # _run_single_task((0, 0, 0))
