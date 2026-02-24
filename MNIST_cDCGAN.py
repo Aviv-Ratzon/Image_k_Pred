@@ -859,11 +859,8 @@ def plot_trial_statistics(base_folder):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def _run_single_task(args):
-    """Worker: train and visualize for one (A, seed) on assigned GPU. Runs in subprocess."""
-    task_idx, A, seed = args
-    num_gpus = 8
-    gpu_id = task_idx % num_gpus
+def _run_single_task_on_gpu(gpu_id, A, seed):
+    """Train and visualize for one (A, seed) on a specific GPU. Runs in subprocess."""
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     exclude_pairs = {
         '4': 1,
@@ -942,22 +939,37 @@ def _run_single_task(args):
     return out_dir
 
 
+def _gpu_worker(gpu_id, tasks_for_gpu):
+    """Run a sequence of (A, seed) tasks on a fixed GPU."""
+    for A, seed in tasks_for_gpu:
+        _run_single_task_on_gpu(gpu_id, A, seed)
+
+
 def main():
-    num_processes = 16
     num_gpus = 8
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass  # Already set
-    tasks = list(itertools.product(np.arange(10), np.arange(10)))
-    # Assign GPU: task_idx % 8 -> 2 processes per GPU
-    task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
-    # shuffle task_args
-    random.shuffle(task_args)
 
-    print(f"Running {len(tasks)} tasks with {num_processes} processes across {num_gpus} GPUs")
-    with mp.Pool(num_processes) as pool:
-        pool.map(_run_single_task, task_args)
+    tasks = list(itertools.product(np.arange(10), np.arange(10)))  # (A, seed)
+    random.shuffle(tasks)
+
+    # One process per GPU, each process gets its own queue of tasks.
+    tasks_by_gpu = [[] for _ in range(num_gpus)]
+    for i, (A, seed) in enumerate(tasks):
+        tasks_by_gpu[i % num_gpus].append((A, seed))
+
+    print(f"Running {len(tasks)} tasks with {num_gpus} processes (1 per GPU) across {num_gpus} GPUs")
+    procs = []
+    for gpu_id in range(num_gpus):
+        p = mp.Process(target=_gpu_worker, args=(gpu_id, tasks_by_gpu[gpu_id]))
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join()
+
     print("All tasks completed.")
     plot_trial_statistics("figures_MNIST_cDCGAN")
 
