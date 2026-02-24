@@ -853,7 +853,7 @@ def _run_single_task(args):
 
     latent_dim = 100
     batch_size = 128
-    epochs = 1
+    epochs = 30
     lr = 2e-4
     cond_dim = 128
     cond_hidden = 256
@@ -862,7 +862,7 @@ def _run_single_task(args):
     random.seed(int(seed))
     np.random.seed(int(seed))
 
-    out_dir = f"figures_cDCGAN/A_{A}/seed_{seed}"
+    out_dir = f"figures_MNIST_cDCGAN/A_{A}/seed_{seed}"
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(f"{out_dir}/samples", exist_ok=True)
 
@@ -926,18 +926,20 @@ def main():
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass  # Already set
-    tasks = list(itertools.product(np.arange(10), np.arange(5,120)))
+    tasks = list(itertools.product(np.arange(10), np.arange(10)))
     # Assign GPU: task_idx % 8 -> 2 processes per GPU
     task_args = [(i, A, seed) for i, (A, seed) in enumerate(tasks)]
+    # shuffle task_args
+    random.shuffle(task_args)
 
     print(f"Running {len(tasks)} tasks with {num_processes} processes across {num_gpus} GPUs")
     with mp.Pool(num_processes) as pool:
         pool.map(_run_single_task, task_args)
     print("All tasks completed.")
-    plot_trial_statistics("figures_cDCGAN")
+    plot_trial_statistics("figures_MNIST_cDCGAN")
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     # plot_trial_statistics("figures_cDCGAN")
     # _run_single_task((0, 0, 0))
