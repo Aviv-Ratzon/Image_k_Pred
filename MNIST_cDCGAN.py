@@ -197,6 +197,8 @@ class ConditionEncoder(nn.Module):
         self.combined_fc = nn.Sequential(
             nn.Linear(self.img_fc_out + hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, cond_dim),
             nn.LeakyReLU(0.2),
         )
@@ -341,9 +343,10 @@ def train_cdcgan(
 
             # ----- Train Discriminator -----
             opt_D.zero_grad()
-            cond = cond_encoder(source_imgs, action_obs)
-            z = torch.randn(B, latent_dim, device=device)
-            fake_imgs = G(z, cond)
+            with torch.no_grad():
+                cond = cond_encoder(source_imgs, action_obs)
+                z = torch.randn(B, latent_dim, device=device)
+                fake_imgs = G(z, cond)
 
             # Instance noise: add to inputs before D (helps prevent mode collapse)
             real_in = target_imgs + noise_std * torch.randn_like(target_imgs, device=device) if noise_std > 0 else target_imgs
@@ -882,9 +885,10 @@ def _run_single_task(args):
     opt_G = optim.AdamW(
         list(G.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
     )
-    opt_D = optim.AdamW(
-        list(D.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
-    )
+    # opt_D = optim.AdamW(
+    #     list(D.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
+    # )
+    opt_D = optim.AdamW(D.parameters(), lr=lr, betas=(0.5, 0.999))
 
     # Anti-mode-collapse: spectral norm (in D), label smoothing, instance noise
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Training...")
