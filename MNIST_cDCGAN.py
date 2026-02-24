@@ -952,7 +952,7 @@ def main():
     except RuntimeError:
         pass  # Already set
 
-    tasks = list(itertools.product(np.arange(10), np.arange(10)))  # (A, seed)
+    tasks = list(itertools.product(np.arange(10), np.arange(10,30)))  # (A, seed)
     random.shuffle(tasks)
 
     # One process per GPU, each process gets its own queue of tasks.
