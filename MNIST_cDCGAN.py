@@ -26,6 +26,13 @@ import os
 N_DIGITS = 10
 
 # ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+# If False: do NOT train; load checkpoint (if present) and only run plots/stats.
+TRAIN_MODEL = True
+CHECKPOINT_FILENAME = "cdcgan_checkpoint.pt"
+
+# ---------------------------------------------------------------------------
 # Pretrained MNIST Classifier
 # ---------------------------------------------------------------------------
 class MNISTClassifier(nn.Module):
@@ -573,11 +580,38 @@ def save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, sav
     # Map these points back to the encoded condition space
     pca_inv = pca.inverse_transform(pca_points)  # shape (n_samples, cond_dim)
 
-    """Save grid: source | target | generated for random batch conditions."""
+    """Save a grid of samples + a video sweep along PC1.
+
+    The video uses 100x more PCA samples than the grid, then the grid is produced by
+    evenly subsampling those generated images.
+    """
     G.eval()
-    cond = torch.tensor(pca_inv, dtype=torch.float32, device=device)
-    z = torch.randn(n_samples, latent_dim, device=device)
-    fake_imgs = G(z, cond)
+
+    video_n_samples = 100 * n_samples
+    pc1_points_video = np.linspace(pc1_min, pc1_max, video_n_samples)
+    pca_points_video = np.stack([pc1_points_video, np.full(video_n_samples, pc2_mean)], axis=1)
+    pca_inv_video = pca.inverse_transform(pca_points_video)  # (video_n_samples, cond_dim)
+
+    cond_video = torch.tensor(pca_inv_video, dtype=torch.float32, device=device)
+    z_video = torch.randn(video_n_samples, latent_dim, device=device)
+    fake_imgs_video = G(z_video, cond_video)  # [T, 1, 28, 28]
+
+    # Save video of all generated images (one frame per image)
+    video_path = os.path.splitext(save_path)[0] + ".mp4"
+    try:
+        from torchvision.io import write_video  # requires torchvision video backend (PyAV/ffmpeg)
+
+        frames = fake_imgs_video.detach().clamp(-1, 1)
+        frames = ((frames + 1.0) / 2.0 * 255.0).to(torch.uint8)  # [T, 1, H, W]
+        frames = frames.repeat(1, 3, 1, 1).permute(0, 2, 3, 1).cpu()  # [T, H, W, 3]
+        write_video(video_path, frames, fps=30)
+        print(f"Saved PCA sweep video to {video_path}")
+    except Exception as e:
+        print(f"Could not save video to {video_path}: {e}")
+
+    # Subsample evenly for the grid figure
+    grid_idx = np.linspace(0, video_n_samples - 1, n_samples, dtype=int)
+    fake_imgs = fake_imgs_video[torch.as_tensor(grid_idx, device=device)]
 
     grid = make_grid(fake_imgs, nrow=10, normalize=True, padding=2)
     save_image(grid, save_path)
@@ -861,6 +895,8 @@ def plot_trial_statistics(base_folder):
 # ---------------------------------------------------------------------------
 def _run_single_task_on_gpu(gpu_id, A, seed):
     """Train and visualize for one (A, seed) on a specific GPU. Runs in subprocess."""
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
     exclude_pairs = {
         '4': 1,
@@ -882,6 +918,12 @@ def _run_single_task_on_gpu(gpu_id, A, seed):
     np.random.seed(int(seed))
 
     out_dir = f"figures_MNIST_cDCGAN/A_{A}/seed_{seed}"
+    checkpoint_path = os.path.join(out_dir, CHECKPOINT_FILENAME)
+
+    if not TRAIN_MODEL and not os.path.isfile(checkpoint_path):
+        print(f"[GPU {gpu_id}] A={A} seed={seed}: TRAIN_MODEL=False but no checkpoint at {checkpoint_path}; skipping.")
+        return
+
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(f"{out_dir}/samples", exist_ok=True)
 
@@ -906,20 +948,53 @@ def _run_single_task_on_gpu(gpu_id, A, seed):
     )
     # opt_D = optim.AdamW(D.parameters(), lr=lr, betas=(0.5, 0.999))
 
-    # Anti-mode-collapse: spectral norm (in D), label smoothing, instance noise
-    print(f"[GPU {gpu_id}] A={A} seed={seed}: Training...")
-    loss_G_list, loss_D_list = train_cdcgan(
-        G, D, cond_encoder, train_loader, criterion, opt_G, opt_D,
-        latent_dim=latent_dim, device=device, epochs=epochs,
-        sample_dir=f"{out_dir}/samples",
-        label_smooth_real=0.9,
-        label_smooth_fake=0.0,
-        instance_noise_std=0.1,
-        instance_noise_decay=0.99,
-    )
+    loss_G_list, loss_D_list = None, None
+
+    if TRAIN_MODEL:
+        # Anti-mode-collapse: spectral norm (in D), label smoothing, instance noise
+        print(f"[GPU {gpu_id}] A={A} seed={seed}: Training...")
+        loss_G_list, loss_D_list = train_cdcgan(
+            G, D, cond_encoder, train_loader, criterion, opt_G, opt_D,
+            latent_dim=latent_dim, device=device, epochs=epochs,
+            sample_dir=f"{out_dir}/samples",
+            label_smooth_real=0.9,
+            label_smooth_fake=0.0,
+            instance_noise_std=0.1,
+            instance_noise_decay=0.99,
+        )
+
+        ckpt = {
+            "A": A,
+            "seed": seed,
+            "gpu_id": gpu_id,
+            "latent_dim": latent_dim,
+            "cond_dim": cond_dim,
+            "cond_hidden": cond_hidden,
+            "epochs": epochs,
+            "G": G.state_dict(),
+            "D": D.state_dict(),
+            "cond_encoder": cond_encoder.state_dict(),
+            "opt_G": opt_G.state_dict(),
+            "opt_D": opt_D.state_dict(),
+            "loss_G_list": loss_G_list,
+            "loss_D_list": loss_D_list,
+        }
+        torch.save(ckpt, checkpoint_path)
+        print(f"[GPU {gpu_id}] A={A} seed={seed}: Saved checkpoint to {checkpoint_path}")
+    else:
+        print(f"[GPU {gpu_id}] A={A} seed={seed}: Loading checkpoint from {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        G.load_state_dict(ckpt["G"])
+        D.load_state_dict(ckpt["D"])
+        cond_encoder.load_state_dict(ckpt["cond_encoder"])
+        loss_G_list = ckpt.get("loss_G_list")
+        loss_D_list = ckpt.get("loss_D_list")
 
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Saving visualizations...")
-    plot_loss(loss_G_list, loss_D_list, f"{out_dir}/loss.png")
+    if loss_G_list is not None and loss_D_list is not None:
+        plot_loss(loss_G_list, loss_D_list, f"{out_dir}/loss.png")
+    else:
+        print(f"[GPU {gpu_id}] A={A} seed={seed}: No loss history in checkpoint; skipping loss plot.")
     save_samples_grid(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples_grid.png", n_samples=30)
     plot_comparison(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/comparison.png")
     plot_interpolation(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/interpolation.png")
