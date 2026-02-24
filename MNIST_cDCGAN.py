@@ -868,6 +868,10 @@ def _run_single_task(args):
     exclude_pairs = {
         '4': 1,
     }
+    
+    if os.path.exists(f"figures_MNIST_cDCGAN/A_{A}/seed_{seed}/trial_statistics.pkl"):
+        print(f"Skipping A={A} seed={seed} because it already exists")
+        return
 
     latent_dim = 100
     batch_size = 128
@@ -959,6 +963,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
-    plot_trial_statistics("figures_MNIST_cDCGAN")
+    main()
+    # plot_trial_statistics("figures_MNIST_cDCGAN")
     # _run_single_task((0, 0, 0))
