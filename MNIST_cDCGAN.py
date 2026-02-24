@@ -199,6 +199,8 @@ class ConditionEncoder(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, cond_dim),
             nn.LeakyReLU(0.2),
         )
@@ -343,10 +345,10 @@ def train_cdcgan(
 
             # ----- Train Discriminator -----
             opt_D.zero_grad()
-            with torch.no_grad():
-                cond = cond_encoder(source_imgs, action_obs)
-                z = torch.randn(B, latent_dim, device=device)
-                fake_imgs = G(z, cond)
+
+            cond = cond_encoder(source_imgs, action_obs)
+            z = torch.randn(B, latent_dim, device=device)
+            fake_imgs = G(z, cond)
 
             # Instance noise: add to inputs before D (helps prevent mode collapse)
             real_in = target_imgs + noise_std * torch.randn_like(target_imgs, device=device) if noise_std > 0 else target_imgs
@@ -750,8 +752,9 @@ def plot_trial_statistics(base_folder):
     viridis = plt.colormaps["viridis"]
     colors = [viridis(i / max(len(A_vals_sorted) - 1, 1)) for i in range(len(A_vals_sorted))]
 
-    fig, (ax_line, ax_box, ax_box2) = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axs = plt.subplots(2, 3, figsize=(18, 5*2))
 
+    ax_line, ax_box, ax_box2 = (axs[0,0], axs[0,1], axs[0,2])
     # Line plot: R^2 vs n, one line per A (mean across seeds), Viridis gradient
     for idx, A_val in enumerate(A_vals_sorted):
         entries = data_by_A[A_val]
@@ -800,15 +803,15 @@ def plot_trial_statistics(base_folder):
     ax_box2.set_ylabel("Excluded Pairs Accuracy")
     ax_box2.set_title("Excluded Pairs Accuracy by A")
 
-    plt.tight_layout()
-    out_path = os.path.join(base_folder, "trial_statistics_summary.png")
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"Saved {out_path}")
+    # plt.tight_layout()
+    # out_path = os.path.join(base_folder, "trial_statistics_summary.png")
+    # plt.savefig(out_path, dpi=150)
+    # plt.close()
+    # print(f"Saved {out_path}")
 
 
 
-    fig, (ax_box1, ax_box2) = plt.subplots(1, 2, figsize=(12, 5))
+    ax_box1, ax_box2, ax_scatter = (axs[1,0], axs[1,1], axs[1,2])
 
     # Boxplot: Maximal R² per run by A, Viridis gradient
     max_r2_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
@@ -833,8 +836,20 @@ def plot_trial_statistics(base_folder):
     ax_box2.set_ylabel("Accuracy")
     ax_box2.set_title("Accuracy by A")
 
+    max_r2_values = [[d['r2_per_n'][-1][1] for d in data] for data in data_by_A.values()]
+    max_r2_values = [item for sublist in max_r2_values for item in sublist]
+    excluded_pairs_acc_values = [[d['excluded_pairs_accuracy'] for d in data] for data in data_by_A.values()]
+    excluded_pairs_acc_values = [item for sublist in excluded_pairs_acc_values for item in sublist]
+    A_values = [[int(k) for d in v] for k, v in data_by_A.items()]
+    A_values = [item for sublist in A_values for item in sublist]
+
+    ax_scatter.scatter(max_r2_values, excluded_pairs_acc_values, c=A_values)
+    ax_scatter.set_xlabel("Maximal R² (target label)")
+    ax_scatter.set_ylabel("Excluded Pairs Accuracy")
+    ax_scatter.set_title("Maximal R² vs Excluded Pairs Accuracy")
+
     plt.tight_layout()
-    out_path = os.path.join(base_folder, "trial_statistics_summary_2.png")
+    out_path = os.path.join(base_folder, "trial_statistics_summary.png")
     plt.savefig(out_path, dpi=150)
     plt.close()
     print(f"Saved {out_path}")
@@ -885,10 +900,10 @@ def _run_single_task(args):
     opt_G = optim.AdamW(
         list(G.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
     )
-    # opt_D = optim.AdamW(
-    #     list(D.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
-    # )
-    opt_D = optim.AdamW(D.parameters(), lr=lr, betas=(0.5, 0.999))
+    opt_D = optim.AdamW(
+        list(D.parameters()) + list(cond_encoder.parameters()), lr=lr, betas=(0.5, 0.999)
+    )
+    # opt_D = optim.AdamW(D.parameters(), lr=lr, betas=(0.5, 0.999))
 
     # Anti-mode-collapse: spectral norm (in D), label smoothing, instance noise
     print(f"[GPU {gpu_id}] A={A} seed={seed}: Training...")
@@ -944,6 +959,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    # plot_trial_statistics("figures_cDCGAN")
+    # main()
+    plot_trial_statistics("figures_MNIST_cDCGAN")
     # _run_single_task((0, 0, 0))
