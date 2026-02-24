@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 from PIL import Image
 
 
-N_DIGITS = 10  # EMNIST letters: 26 classes
+N_DIGITS = 26  # EMNIST letters: 26 classes
 USE_GPU = True
 
 # Expected CSV format (common Kaggle "A_Z Handwritten Data"):
