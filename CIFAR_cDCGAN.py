@@ -1,6 +1,6 @@
 """
-cDCGAN (conditional Deep Convolutional GAN) for MNIST
-Conditioned on (source image, action) from MNISTActionDataset.
+cDCGAN (conditional Deep Convolutional GAN) for CIFAR-10
+Conditioned on (source image, action) from CIFAR10ActionDataset.
 Uses a ConditionEncoder (CNN + FCN) to encode the conditioning inputs.
 """
 # from torchvision.io import write_video  # requires torchvision video backend (PyAV/ffmpeg)
@@ -24,7 +24,9 @@ import matplotlib.pyplot as plt
 import os
 
 
-N_DIGITS = 10
+N_CLASSES = 10
+IMG_CHANNELS = 3
+IMG_SIZE = 32
 
 # ---------------------------------------------------------------------------
 # Config
@@ -34,58 +36,64 @@ TRAIN_MODEL = True
 SAVE_CHKPT = False
 CHECKPOINT_FILENAME = "cdcgan_checkpoint.pt"
 
-def generate_valid_action(A, s):
-    action_list = np.arange(-A, A + 1)
-    action_list = action_list[(s+action_list >= 0) & (s+action_list < N_DIGITS)]
-    return np.random.choice(action_list)
 # ---------------------------------------------------------------------------
-# Pretrained MNIST Classifier
+# Pretrained CIFAR-10 Classifier
 # ---------------------------------------------------------------------------
-class MNISTClassifier(nn.Module):
-    """Simple CNN classifier for 28x28 grayscale MNIST. Expects input normalized to [-1, 1]."""
+class CIFAR10Classifier(nn.Module):
+    """Simple CNN classifier for 32x32 RGB CIFAR-10. Expects input normalized to [-1, 1]."""
 
     def __init__(self):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, stride=2, padding=1),
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, padding=1),
+            nn.MaxPool2d(2),  # 32 -> 16
+            nn.Conv2d(64, 128, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, stride=2, padding=1),
+            nn.Conv2d(128, 128, 3, padding=1),
             nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 16 -> 8
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 8 -> 4
         )
-        self.fc = nn.Sequential(
-            nn.Linear(64 * 7 * 7, 128),
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 4 * 4, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(128, 10),
+            nn.Linear(256, N_CLASSES),
         )
 
     def forward(self, x):
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+        x = self.features(x)
+        return self.classifier(x)
 
 
-def get_pretrained_mnist_classifier(device, checkpoint_path="checkpoints/mnist_classifier_cdcgan.pt"):
-    """Load pretrained MNIST classifier, training it first if checkpoint does not exist."""
+def get_pretrained_cifar10_classifier(device, checkpoint_path="checkpoints/cifar10_classifier_cdcgan.pt"):
+    """Load pretrained CIFAR-10 classifier, training it first if checkpoint does not exist."""
     d = os.path.dirname(checkpoint_path)
     if d:
         os.makedirs(d, exist_ok=True)
-    classifier = MNISTClassifier().to(device)
+    classifier = CIFAR10Classifier().to(device)
     if os.path.isfile(checkpoint_path):
         classifier.load_state_dict(torch.load(checkpoint_path, map_location=device))
         classifier.eval()
         print(f"Loaded pretrained classifier from {checkpoint_path}")
         return classifier
     # Train classifier
-    print(f"Training MNIST classifier (saving to {checkpoint_path})...")
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-    train_ds = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
+    print(f"Training CIFAR-10 classifier (saving to {checkpoint_path})...")
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
+    train_ds = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
-    test_ds = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+    test_ds = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     test_loader = DataLoader(test_ds, batch_size=128, shuffle=True, num_workers=0)
     opt = optim.Adam(classifier.parameters(), lr=1e-3)
     classifier.train()
@@ -111,34 +119,34 @@ def get_pretrained_mnist_classifier(device, checkpoint_path="checkpoints/mnist_c
 
 
 # ---------------------------------------------------------------------------
-# MNISTActionDataset
+# CIFAR10ActionDataset
 # ---------------------------------------------------------------------------
-class MNISTActionDataset(torch.utils.data.Dataset):
-    """Dataset for MNIST with action-based transformations."""
+class CIFAR10ActionDataset(torch.utils.data.Dataset):
+    """Dataset for CIFAR-10 with action-based transformations in label space."""
 
-    def __init__(self, A=2, cyclic=False, transform=None, exclude_pairs={}):
+    def __init__(self, A=2, cyclic=False, transform=None, exclude_pairs=None):
         self.A = A
         self.cyclic = cyclic
         self.transform = transform
-        self.action_dim = 2 * (N_DIGITS-1) + 1
+        self.action_dim = 2 * (N_CLASSES - 1) + 1
         self.only_zero_action = False
         self.onehot = lambda x: torch.eye(self.action_dim)[x + A].float()
-        self.exclude_pairs = {f'{i}':j for i, j in exclude_pairs.items()} if exclude_pairs is not None else {}
+        if exclude_pairs is None:
+            exclude_pairs = {}
+        self.exclude_pairs = {f"{i}": j for i, j in exclude_pairs.items()}
 
-        self.dataset = torchvision.datasets.MNIST(
-            root="./data", train=True, download=True, transform=transform
-        )
-        self.data_idx_by_class = {i: [] for i in range(10)}
+        self.dataset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+        self.data_idx_by_class = {i: [] for i in range(N_CLASSES)}
         self.images = []
         self.labels = []
         for idx, (image, label) in enumerate(self.dataset):
-            if label >= N_DIGITS:
+            if label >= N_CLASSES:
                 continue
             self.data_idx_by_class[label].append(idx)
             self.images.append(image)
             self.labels.append(label)
-        self._class_size = [len(self.data_idx_by_class[c]) for c in range(10)]
-        print(f"MNISTActionDataset: A={A}, cyclic={cyclic}, samples={len(self.images)}")
+        self._class_size = [len(self.data_idx_by_class[c]) for c in range(N_CLASSES)]
+        print(f"CIFAR10ActionDataset: A={A}, cyclic={cyclic}, samples={len(self.images)}")
 
     def __len__(self):
         return len(self.images)
@@ -154,9 +162,11 @@ class MNISTActionDataset(torch.utils.data.Dataset):
             target_label = label
         elif self.cyclic:
             action = random.choice(action_list)
-            target_label = (label + action) % 10
+            target_label = (label + action) % N_CLASSES
         else:
-            action_list = action_list[(action_list >= max(-label, -self.A)) & (action_list <= min(9 - label, self.A))]
+            action_list = action_list[
+                (action_list >= max(-label, -self.A)) & (action_list <= min((N_CLASSES - 1) - label, self.A))
+            ]
             action = random.choice(action_list)
             target_label = label + action
         action_obs = self.onehot(action)
@@ -186,15 +196,17 @@ class ConditionEncoder(nn.Module):
         super().__init__()
         self.action_dim = action_dim
         self.cond_dim = cond_dim
-        # CNN for image (1, 28, 28)
+        # CNN for image (3, 32, 32)
         self.img_conv = nn.Sequential(
-            nn.Conv2d(1, 32, 4, 2, 1),   # 28 -> 14
+            nn.Conv2d(IMG_CHANNELS, 32, 4, 2, 1),   # 32 -> 16
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 64, 4, 2, 1),  # 14 -> 7
+            nn.Conv2d(32, 64, 4, 2, 1),  # 16 -> 8
             nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 128, 4, 2, 1),  # 7 -> 4
+            nn.Conv2d(64, 128, 4, 2, 1),  # 8 -> 4
             nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 256, 3, 1, 0),  # 4 -> 2
+            nn.Conv2d(128, 256, 4, 2, 1),  # 4 -> 2
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(256, 256, 2, 1, 0),  # 2 -> 1
             nn.LeakyReLU(0.2),
         )
         # Conv output: 256 * 1 * 1
@@ -214,17 +226,15 @@ class ConditionEncoder(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, cond_dim),
             nn.LeakyReLU(0.2),
         )
 
     def forward(self, image, action_obs):
-        # image: [B, 1, 28, 28] or [B, 784]
+        # image: [B, 3, 32, 32] or [B, 3072]
         # action_obs: [B, action_dim]
         if image.dim() == 2:
-            image = image.view(-1, 1, 28, 28)
+            image = image.view(-1, IMG_CHANNELS, IMG_SIZE, IMG_SIZE)
         img_feat = self.img_conv(image)
         img_feat = img_feat.view(img_feat.size(0), -1)
         action_feat = self.action_fc(action_obs)
@@ -239,21 +249,30 @@ class Generator(nn.Module):
     def __init__(self, latent_dim=100, cond_dim=128):
         super().__init__()
         self.latent_dim = latent_dim
-        self.init_size = 7
-        self.fc = nn.Sequential(nn.Linear(latent_dim + cond_dim, 1024), 
-                                nn.LeakyReLU(0.2),
-                                nn.Linear(1024, 1024),
-                                nn.LeakyReLU(0.2),
-                                nn.Linear(1024, 256 * self.init_size ** 2))
+        self.init_size = 8  # 8 -> 16 -> 32
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim + cond_dim, 1024),
+            nn.LeakyReLU(0.2),
+            nn.Linear(1024, 1024),
+            nn.LeakyReLU(0.2),
+            nn.Linear(1024, 256 * self.init_size ** 2),
+        )
                                 
+        # Slightly deeper head helps with CIFAR texture/detail at 32x32.
         self.conv_blocks = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 7 -> 14
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 8 -> 16
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),   # 14 -> 28
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),  # 16 -> 32
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, 3, 1, 1),
+            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, IMG_CHANNELS, 3, 1, 1),
             nn.Tanh(),
         )
 
@@ -283,38 +302,36 @@ def _make_linear_layer(in_feat, out_feat, spectral_norm=False):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, cond_dim=128, cond_spatial_channels=16, use_spectral_norm=True):
+    def __init__(self, cond_dim=128, cond_spatial_channels=16, use_spectral_norm=True, feature_dim=512):
         super().__init__()
         self.cond_dim = cond_dim
         self.cond_spatial_channels = cond_spatial_channels
         sn = use_spectral_norm
-        self.cond_to_spatial = _make_linear_layer(cond_dim, cond_spatial_channels, spectral_norm=sn)
+        self.feature_dim = feature_dim
+
+        # Projection discriminator: score(img, cond) = f(img) + <W(cond), h(img)>
+        # This is typically more effective than spatial concatenation for conditional GANs on CIFAR-scale images.
         self.conv_blocks = nn.Sequential(
-            _make_conv_layer(1 + cond_spatial_channels, 64, 4, 2, 1, spectral_norm=sn),
-            nn.LeakyReLU(0.2),
-            _make_conv_layer(64, 128, 4, 2, 1, spectral_norm=sn),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            _make_conv_layer(128, 256, 4, 2, 1, spectral_norm=sn),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2),
-            _make_conv_layer(256, 512, 3, 1, 0, spectral_norm=sn),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2),
+            _make_conv_layer(IMG_CHANNELS, 128, 3, 1, 1, spectral_norm=sn),
+            nn.LeakyReLU(0.2, inplace=True),
+            _make_conv_layer(128, 128, 4, 2, 1, spectral_norm=sn),  # 32 -> 16
+            nn.LeakyReLU(0.2, inplace=True),
+            _make_conv_layer(128, 256, 4, 2, 1, spectral_norm=sn),  # 16 -> 8
+            nn.LeakyReLU(0.2, inplace=True),
+            _make_conv_layer(256, 512, 4, 2, 1, spectral_norm=sn),  # 8 -> 4
+            nn.LeakyReLU(0.2, inplace=True),
+            _make_conv_layer(512, feature_dim, 4, 1, 0, spectral_norm=sn),  # 4 -> 1
+            nn.LeakyReLU(0.2, inplace=True),
         )
-        self.fc = _make_linear_layer(512 + cond_dim, 1, spectral_norm=sn)
+        self.fc = _make_linear_layer(feature_dim, 1, spectral_norm=sn)
+        self.cond_proj = _make_linear_layer(cond_dim, feature_dim, spectral_norm=sn)
 
     def forward(self, img, cond):
-        # Project cond to spatial channels and broadcast
-        c_spatial = self.cond_to_spatial(cond)  # [B, cond_spatial_channels]
-        c_spatial = c_spatial.view(-1, self.cond_spatial_channels, 1, 1).expand(
-            -1, -1, img.size(2), img.size(3)
-        )
-        x = torch.cat([img, c_spatial], dim=1)
-        x = self.conv_blocks(x)
-        x = x.view(x.size(0), -1)
-        x = torch.cat([x, cond], dim=1)
-        return self.fc(x)
+        h = self.conv_blocks(img)  # [B, feature_dim, 1, 1]
+        h = h.view(h.size(0), self.feature_dim)  # [B, feature_dim]
+        out = self.fc(h)  # [B, 1]
+        proj = torch.sum(self.cond_proj(cond) * h, dim=1, keepdim=True)  # [B, 1]
+        return out + proj
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +431,14 @@ def train_cdcgan(
 # ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
+def _tensor_to_vis_img(img_chw: torch.Tensor) -> np.ndarray:
+    """Convert a single image tensor CHW in [-1,1] to HWC float in [0,1] for matplotlib."""
+    img = img_chw.detach().float().cpu().clamp(-1, 1)
+    img = (img + 1.0) / 2.0
+    img = img.permute(1, 2, 0).numpy()
+    return img
+
+
 def plot_loss(loss_G_list, loss_D_list, save_path):
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(loss_D_list, label="Discriminator", color="C0")
@@ -471,13 +496,13 @@ def plot_comparison(G, cond_encoder, train_loader, latent_dim, device, save_path
         for j in range(2):
             for i in range(n):
                 ind = i + j*n
-                axs[i, j*4+0].imshow(source_imgs[ind, 0].cpu().numpy(), cmap="gray")
+                axs[i, j*4+0].imshow(_tensor_to_vis_img(source_imgs[ind]))
                 axs[i, j*4+0].set_ylabel(f"s:{labels[ind].item()}→{target_labels[ind].item()} a:{actions[ind].item()}")
                 axs[i, j*4+0].axis("off")
-                axs[i, j*4+1].imshow(target_imgs[ind, 0].cpu().numpy(), cmap="gray")
+                axs[i, j*4+1].imshow(_tensor_to_vis_img(target_imgs[ind]))
                 axs[i, j*4+1].set_title("Target")
                 axs[i, j*4+1].axis("off")
-                axs[i, j*4+2].imshow(fake_imgs[ind, 0].cpu().numpy(), cmap="gray")
+                axs[i, j*4+2].imshow(_tensor_to_vis_img(fake_imgs[ind]))
                 axs[i, j*4+2].set_title("Generated")
                 axs[i, j*4+2].axis("off")
     axs[0, 0].set_title("Source")
@@ -602,7 +627,7 @@ def save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, sav
 
     cond_video = torch.tensor(pca_inv_video, dtype=torch.float32, device=device)
     z_video = torch.randn(video_n_samples, latent_dim, device=device)
-    fake_imgs_video = G(z_video, cond_video)  # [T, 1, 28, 28]
+    fake_imgs_video = G(z_video, cond_video)  # [T, 3, 32, 32]
 
     # # Save video of all generated images (one frame per image)
     # video_path = os.path.splitext(save_path)[0] + ".mp4"
@@ -757,15 +782,12 @@ def save_trial_statistics(G, cond_encoder, train_loader, latent_dim, device, sav
 
 
 def plot_trial_statistics(base_folder):
-    """Load trial_statistics.pkl from each A_* / seed_* folder and plot R^2 vs n (line) and summary violin plots."""
+    """Load trial_statistics.pkl from each A_* / seed_* folder and plot R^2 vs n (line) and PR (boxplot)."""
     import pickle
     import glob
 
     # Collect data: A_value -> list of {participation_ratio, r2_per_n}
     data_by_A = {}
-    acc_by_A = [[] for _ in range(N_DIGITS)]
-    accuracy_cutoff = 0.3
-    total_runs = 0
     for A_dir in sorted(glob.glob(os.path.join(base_folder, "A_*"))):
         if not os.path.isdir(A_dir):
             continue
@@ -785,16 +807,12 @@ def plot_trial_statistics(base_folder):
             except Exception as e:
                 print(f"error loading trial statistics for {seed_dir}: {e}")
                 continue
-            acc_by_A[int(A_val)].append(stats["classifier_accuracy"])
-            total_runs += 1
-            if stats["classifier_accuracy"] < accuracy_cutoff:
+            if stats["classifier_accuracy"] < 0.3:
                 continue
-            stats['n_l'] = stats['n_l']
-            stats['r2_per_n'] = stats['r2_per_n']
+            stats['n_l'] = stats['n_l'][:15]
+            stats['r2_per_n'] = stats['r2_per_n'][:15]
             if "excluded_pairs_accuracy" in stats:
                 stats['excluded_pairs_accuracy'] = stats['excluded_pairs_accuracy']
-            else:
-                stats['excluded_pairs_accuracy'] = 0
             data_by_A[A_val].append(stats)
 
     if not data_by_A:
@@ -821,45 +839,26 @@ def plot_trial_statistics(base_folder):
         ax_line.fill_between(n_vals, r2_mean - r2_std, r2_mean + r2_std, alpha=0.2, color=c)
     ax_line.set_xlabel("n (number of PCs)")
     ax_line.set_ylabel("R² (target label)")
-    ax_line.set_title(f"R² vs first n PCs (total runs: {total_runs})")
+    ax_line.set_title("R² vs first n PCs")
     ax_line.legend()
     ax_line.grid(True, alpha=0.3)
 
-    # Violin plot: Participation Ratio per A, Viridis gradient
+    # Boxplot: Participation Ratio per A, Viridis gradient
     pr_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
     pr_values = [[e["participation_ratio"] for e in entries] for entries in pr_by_A]
     A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
-    positions = np.arange(1, len(pr_values) + 1)
-    vp = ax_box.violinplot(
-        pr_values,
-        positions=positions,
-        showmedians=True,
-        showmeans=True,
-        showextrema=True,
-    )
-    for i, body in enumerate(vp["bodies"]):
-        body.set_facecolor(colors[i])
-        body.set_edgecolor("black")
-        body.set_alpha(0.8)
-    for k in ("cmedians", "cmins", "cmaxes", "cbars"):
-        if k in vp:
-            vp[k].set_color("black")
-            vp[k].set_linewidth(1)
-    ax_box.set_xticks(positions)
-    ax_box.set_xticklabels(A_labels)
-
-    # Add number of samples as text above each violin
-    y0, y1 = ax_box.get_ylim()
-    y_offset = 0.02 * (y1 - y0) if (y1 - y0) != 0 else 0.05
-    for i, vals in enumerate(pr_values):
-        if len(vals) == 0:
-            continue
-        y = float(np.max(vals))
-        ax_box.text(positions[i], y + y_offset, f"n={len(vals)}", ha="center", va="bottom", fontsize=9)
+    bp = ax_box.boxplot(pr_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
+        # Add number of samples as text above the box
+        n_samples = len(pr_values[i])
+        # Find the y position (top whisker)
+        whisker_y = bp['whiskers'][2 * i + 1].get_ydata()[1]
+        ax_box.text(i + 1, whisker_y + 0.05, f"n={n_samples}", ha='center', va='bottom', fontsize=9)
     ax_box.set_ylabel("Participation Ratio")
     ax_box.set_title("Participation Ratio by A")
 
-    # Violin plot: Excluded Pairs Accuracy per A, Viridis gradient
+    # Boxplot: Excluded Pairs Accuracy per A, Viridis gradient
     excluded_pairs_acc_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
     excluded_pairs_acc_values = []
     for entries in excluded_pairs_acc_by_A:
@@ -869,27 +868,11 @@ def plot_trial_statistics(base_folder):
                 vals_l.append(e["excluded_pairs_accuracy"])
         excluded_pairs_acc_values.append(vals_l)
     A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
-    positions = np.arange(1, len(excluded_pairs_acc_values) + 1)
-    vp = ax_box2.violinplot(
-        excluded_pairs_acc_values,
-        positions=positions,
-        showmeans=True,
-        showmedians=True,
-        showextrema=True,
-    )
-    for i, body in enumerate(vp["bodies"]):
-        body.set_facecolor(colors[i])
-        body.set_edgecolor("black")
-        body.set_alpha(0.8)
-    for k in ("cmedians", "cmins", "cmaxes", "cbars"):
-        if k in vp:
-            vp[k].set_color("black")
-            vp[k].set_linewidth(1)
-    ax_box2.set_xticks(positions)
-    ax_box2.set_xticklabels(A_labels)
+    bp = ax_box2.boxplot(excluded_pairs_acc_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
     ax_box2.set_ylabel("Excluded Pairs Accuracy")
     ax_box2.set_title("Excluded Pairs Accuracy by A")
-    ax_box2.set_ylim(-0.1, 1.1)
 
     # plt.tight_layout()
     # out_path = os.path.join(base_folder, "trial_statistics_summary.png")
@@ -899,106 +882,42 @@ def plot_trial_statistics(base_folder):
 
 
 
-    ax_box1, ax_hist, ax_scatter = (axs[1,0], axs[1,1], axs[1,2])
+    ax_box1, ax_box2, ax_scatter = (axs[1,0], axs[1,1], axs[1,2])
 
-    # Violin plot: Maximal R² per run by A, Viridis gradient
+    # Boxplot: Maximal R² per run by A, Viridis gradient
     max_r2_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
     max_r2_values = [
-        [e["r2_per_n"][0][-1] for e in entries] 
+        [e["r2_per_n"][0][1] for e in entries] 
         for entries in max_r2_by_A
     ]
     A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
-    positions = np.arange(1, len(max_r2_values) + 1)
-    vp = ax_box1.violinplot(
-        max_r2_values,
-        positions=positions,
-        showmedians=True,
-        showmeans=True,
-        showextrema=True,
-    )
-    for i, body in enumerate(vp["bodies"]):
-        body.set_facecolor(colors[i])
-        body.set_edgecolor("black")
-        body.set_alpha(0.8)
-    for k in ("cmedians", "cmins", "cmaxes", "cbars"):
-        if k in vp:
-            vp[k].set_color("black")
-            vp[k].set_linewidth(1)
-    ax_box1.set_xticks(positions)
-    ax_box1.set_xticklabels(A_labels)
+    bp = ax_box1.boxplot(max_r2_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
     ax_box1.set_ylabel("Maximal R² (target label)")
     ax_box1.set_title("Maximal R² by A")
 
-    # Classifier Accuracy per A
+    # Boxplot: Participation Ratio per A, Viridis gradient
+    acc_by_A = [data_by_A[A_val] for A_val in A_vals_sorted]
+    acc_values = [[e["classifier_accuracy"] for e in entries] for entries in acc_by_A]
+    A_labels = [f"A={A_val}" for A_val in A_vals_sorted]
+    bp = ax_box2.boxplot(acc_values, labels=A_labels, patch_artist=True)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(colors[i])
+    ax_box2.set_ylabel("Accuracy")
+    ax_box2.set_title("Accuracy by A")
 
-    from matplotlib import cm
-    # acc_by_A = [np.array([d['classifier_accuracy'] for d in data_by_A[A_val]]) for A_val in A_vals_sorted]
-    
-    # Prepare axes for N_DIGITS rows, sharing x axis
-    digit_colors = cm.viridis(np.linspace(0, 1, N_DIGITS))
-    
-    bins = np.linspace(0, 1, 21)
-    for d in range(N_DIGITS):
-        # Gather the accuracies for class d, for all A and all runs
-        digit_accs = acc_by_A[d]
-        # Normalize histogram for this digit
-        if len(digit_accs) == 0:
-            continue
-        histogram = np.histogram(digit_accs, bins=bins, density=True)[0]
-        histogram = 3*histogram / (1 / (np.diff(bins).mean()))
-        ax_hist.bar(np.arange(len(histogram)), histogram, color=digit_colors[d], bottom=d, edgecolor='k', linewidth=1)
-    ax_hist.set_yticks(np.arange(N_DIGITS) + 0.5)
-    ax_hist.set_yticklabels([f"Digit {d}" for d in range(N_DIGITS)])
-    ax_hist.set_xticks(np.arange(len(bins)-1)[::2])
-    ax_hist.set_xticklabels(np.round(bins[:-1][::2], 2))
-    loc = np.where(bins>0.3)[0][0]
-    ax_hist.axvline(x=loc, color='red', linestyle='--', linewidth=1)
-    ax_hist.set_xlabel("Classifier Accuracy")
-    ax_hist.set_title("Classifier Accuracy Histograms by Digit")
-
-    max_r2_values = [[d['r2_per_n'][1][-1] for d in data] for data in data_by_A.values()]
+    max_r2_values = [[d['r2_per_n'][-1][1] for d in data] for data in data_by_A.values()]
     max_r2_values = [item for sublist in max_r2_values for item in sublist]
     excluded_pairs_acc_values = [[d['excluded_pairs_accuracy'] for d in data] for data in data_by_A.values()]
     excluded_pairs_acc_values = [item for sublist in excluded_pairs_acc_values for item in sublist]
     A_values = [[int(k) for d in v] for k, v in data_by_A.items()]
     A_values = [item for sublist in A_values for item in sublist]
 
-    from scipy import stats
-
-    # Scatter plot
-    sc = ax_scatter.scatter(
-        max_r2_values, 
-        excluded_pairs_acc_values, 
-        c=A_values, 
-        s=50, 
-        edgecolors='k', 
-        linewidths=0.5
-    )
-
-    # Linear regression (least-squares fit)
-    slope, intercept, r_value, p_value, std_err = stats.linregress(max_r2_values, excluded_pairs_acc_values)
-    line_x = np.linspace(min(max_r2_values), max(max_r2_values), 100)
-    line_y = slope * line_x + intercept
-    ax_scatter.plot(line_x, line_y, color='red', linestyle='--', lw=5)
-
-    # Statistical annotation
-    stat_power = 1 - stats.norm.cdf(stats.norm.ppf(1-p_value/2) - abs(slope)/std_err)  # or report p explicitly
-    annotation_text = (
-        f"Slope={slope:.2f}, $R^2$={r_value**2:.2f}"
-    )
-    ax_scatter.annotate(
-        annotation_text,
-        xy=(0.05, 0.95),
-        xycoords='axes fraction',
-        fontsize=10,
-        ha='left', va='top',
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8)
-    )
-
+    ax_scatter.scatter(max_r2_values, excluded_pairs_acc_values, c=A_values)
     ax_scatter.set_xlabel("Maximal R² (target label)")
     ax_scatter.set_ylabel("Excluded Pairs Accuracy")
     ax_scatter.set_title("Maximal R² vs Excluded Pairs Accuracy")
-    ax_scatter.legend(loc="lower right")
 
     plt.tight_layout()
     out_path = os.path.join(base_folder, "trial_statistics_summary.png")
@@ -1016,20 +935,17 @@ def _run_single_task_on_gpu(gpu_id, A, seed):
     if torch.cuda.is_available():
         torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
-    if A==0:
-        exclude_pairs = None
-    else:
-        num_exclude = np.random.randint(1, A+1)
-        states = np.random.choice(range(N_DIGITS), size=num_exclude, replace=True)
-        exclude_pairs = {f'{states[i]}': generate_valid_action(A, states[i]) for i in range(num_exclude)}
-        print(f"Exclude pairs: {exclude_pairs}")
-    if os.path.exists(f"figures_MNIST_cDCGAN/A_{A}/seed_{seed}/trial_statistics.pkl") and TRAIN_MODEL:
+    exclude_pairs = {
+        '4': 1,
+    }
+    
+    if os.path.exists(f"figures_CIFAR_cDCGAN/A_{A}/seed_{seed}/trial_statistics.pkl") and TRAIN_MODEL:
         print(f"Skipping A={A} seed={seed} because it already exists")
         return
 
     latent_dim = 100
     batch_size = 128
-    epochs = 30
+    epochs = 200
     lr = 2e-4
     cond_dim = 128
     cond_hidden = 256
@@ -1038,7 +954,7 @@ def _run_single_task_on_gpu(gpu_id, A, seed):
     random.seed(int(seed))
     np.random.seed(int(seed))
 
-    out_dir = f"figures_MNIST_cDCGAN/A_{A}/seed_{seed}"
+    out_dir = f"figures_CIFAR_cDCGAN/A_{A}/seed_{seed}"
     checkpoint_path = os.path.join(out_dir, CHECKPOINT_FILENAME)
 
     if not TRAIN_MODEL and not os.path.isfile(checkpoint_path):
@@ -1050,12 +966,12 @@ def _run_single_task_on_gpu(gpu_id, A, seed):
 
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    dataset = MNISTActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
+    dataset = CIFAR10ActionDataset(A=A, cyclic=False, transform=transform, exclude_pairs=exclude_pairs)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-    action_dim = 2 * (N_DIGITS-1) + 1
+    action_dim = 2 * (N_CLASSES - 1) + 1
     cond_encoder = ConditionEncoder(action_dim=action_dim, cond_dim=cond_dim, hidden_dim=cond_hidden).to(device)
     G = Generator(latent_dim=latent_dim, cond_dim=cond_dim).to(device)
     D = Discriminator(cond_dim=cond_dim).to(device)
@@ -1123,7 +1039,7 @@ def _run_single_task_on_gpu(gpu_id, A, seed):
     save_samples_grid(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples/final.png", n_samples=20)
     plot_cond_pca(cond_encoder, train_loader, device, f"{out_dir}/cond_pca.png")
     save_samples_grid_pca(G, cond_encoder, train_loader, latent_dim, device, f"{out_dir}/samples_grid_pca.png", n_samples=40)
-    classifier = get_pretrained_mnist_classifier(device)
+    classifier = get_pretrained_cifar10_classifier(device)
     dataset.only_zero_action = True
     test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     if exclude_pairs is not None:
@@ -1150,7 +1066,7 @@ def main():
     except RuntimeError:
         pass  # Already set
 
-    tasks = list(itertools.product(np.arange(1), np.arange(0, 300)))  # (A, seed)
+    tasks = list(itertools.product(np.arange(10), np.arange(100, 300)))  # (A, seed)
     random.shuffle(tasks)
 
     # One process per GPU, each process gets its own queue of tasks.
@@ -1169,10 +1085,10 @@ def main():
         p.join()
 
     print("All tasks completed.")
-    plot_trial_statistics("figures_MNIST_cDCGAN")
+    plot_trial_statistics("figures_CIFAR_cDCGAN")
 
 
 if __name__ == "__main__":
     # main()
-    plot_trial_statistics("figures_MNIST_cDCGAN")
-    # _run_single_task_on_gpu(1, 0, 0)
+    # plot_trial_statistics("figures_CIFAR_cDCGAN")
+    _run_single_task_on_gpu(0, 0, 0)
